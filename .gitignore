@@ -1,0 +1,8 @@
+# build output
+/bin/
+*.o
+
+# demo files and their decode logs — don't commit binaries / large samples
+*.dm_1
+*.dm_1.log
+*.log
