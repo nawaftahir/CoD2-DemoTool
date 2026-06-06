@@ -529,4 +529,155 @@ void MSG_WriteDeltaPlayerstate( msg_t *msg, playerState_t *from, playerState_t *
 	}
 }
 
+// ----------------------------------------------------------------------
+//  C) Message builders — assemble a full snapshot / gamestate from the
+//     decoder's live state (cl / clc); the offline mirror of the server's
+//     SV_WriteSnapshotToClient / SV_SendClientGameState.
+// ----------------------------------------------------------------------
+
+// Entity-list delta. Mirrors CL_ParsePacketEntities / SV_EmitPacketEntities.
+void SV_EmitPacketEntities( clSnapshot_t *from, clSnapshot_t *to, msg_t *msg )
+{
+	int from_num = from ? from->numEntities : 0;
+	int to_num   = to->numEntities;
+	int oldindex = 0, newindex = 0;
+
+	while ( newindex < to_num || oldindex < from_num )
+	{
+		entityState_t *newent = NULL, *oldent = NULL;
+		int newnum = 99999, oldnum = 99999;
+
+		if ( newindex < to_num )
+		{
+			newent = &cl.parseEntities[ ( to->parseEntitiesNum + newindex ) & ( MAX_PARSE_ENTITIES - 1 ) ];
+			newnum = newent->number;
+		}
+		if ( oldindex < from_num )
+		{
+			oldent = &cl.parseEntities[ ( from->parseEntitiesNum + oldindex ) & ( MAX_PARSE_ENTITIES - 1 ) ];
+			oldnum = oldent->number;
+		}
+
+		if ( newnum == oldnum )
+		{
+			MSG_WriteDeltaEntity( msg, oldent, newent, qfalse );  // changed, or nothing if unchanged
+			oldindex++; newindex++;
+		}
+		else if ( newnum < oldnum )
+		{
+			MSG_WriteDeltaEntity( msg, &cl.entityBaselines[ newnum ], newent, qtrue );  // new, from baseline
+			newindex++;
+		}
+		else
+		{
+			MSG_WriteDeltaEntity( msg, oldent, NULL, qtrue );     // removed
+			oldindex++;
+		}
+	}
+	MSG_WriteBits( msg, MAX_GENTITIES - 1, GENTITYNUM_BITS );      // end-of-list sentinel
+}
+
+// Client-list delta. Mirrors CL_ParsePacketClients. Each present client carries
+// a leading "available" bit (emitted by MSG_WriteDeltaClient's change-bit); the
+// list ends with a 0 bit.
+void SV_EmitPacketClients( clSnapshot_t *from, clSnapshot_t *to, msg_t *msg )
+{
+	int from_num = from ? from->numClients : 0;
+	int to_num   = to->numClients;
+	int oldindex = 0, newindex = 0;
+
+	while ( newindex < to_num || oldindex < from_num )
+	{
+		clientState_t *newcl = NULL, *oldcl = NULL;
+		int newnum = 99999, oldnum = 99999;
+
+		if ( newindex < to_num )
+		{
+			newcl = &cl.parseClients[ ( to->parseClientsNum + newindex ) & ( MAX_PARSE_CLIENTS - 1 ) ];
+			newnum = newcl->number;
+		}
+		if ( oldindex < from_num )
+		{
+			oldcl = &cl.parseClients[ ( from->parseClientsNum + oldindex ) & ( MAX_PARSE_CLIENTS - 1 ) ];
+			oldnum = oldcl->number;
+		}
+
+		if ( newnum == oldnum )
+		{
+			MSG_WriteDeltaClient( msg, oldcl, newcl, qfalse );
+			oldindex++; newindex++;
+		}
+		else if ( newnum < oldnum )
+		{
+			MSG_WriteDeltaClient( msg, NULL, newcl, qtrue );
+			newindex++;
+		}
+		else
+		{
+			MSG_WriteDeltaClient( msg, oldcl, NULL, qtrue );
+			oldindex++;
+		}
+	}
+	MSG_WriteBit0( msg );                                          // no-more-clients
+}
+
+// Full svc_snapshot. Delta base is the decoder's stored frame at deltaNum.
+void SV_WriteSnapshot( clSnapshot_t *snap, msg_t *msg )
+{
+	clSnapshot_t *old = NULL;
+	int lastframe = 0;
+
+	if ( snap->deltaNum > 0 )
+	{
+		old = &cl.snapshots[ snap->deltaNum & PACKET_MASK ];
+		if ( old->valid )
+			lastframe = snap->messageNum - snap->deltaNum;
+		else
+			old = NULL;
+	}
+
+	MSG_WriteByte( msg, svc_snapshot );
+	MSG_WriteLong( msg, snap->serverTime );
+	MSG_WriteByte( msg, lastframe );
+	MSG_WriteByte( msg, snap->snapFlags );
+
+	MSG_WriteDeltaPlayerstate( msg, old ? &old->ps : NULL, &snap->ps );
+	SV_EmitPacketEntities( old, snap, msg );
+	SV_EmitPacketClients( old, snap, msg );
+}
+
+// Full svc_gamestate from the decoded configstrings + baselines.
+void SV_WriteGameState( msg_t *msg )
+{
+	MSG_WriteByte( msg, svc_gamestate );
+	MSG_WriteLong( msg, clc.serverCommandSequence );
+
+	for ( int i = 0; i < MAX_CONFIGSTRINGS; i++ )
+	{
+		if ( cl.gameState.stringOffsets[ i ] == 0 )
+			continue;
+		const char *cs = cl.gameState.stringData + cl.gameState.stringOffsets[ i ];
+		if ( !cs[ 0 ] )
+			continue;
+		MSG_WriteByte( msg, svc_configstring );
+		MSG_WriteShort( msg, i );
+		MSG_WriteBigStringRaw( msg, cs );
+	}
+
+	entityState_t nullstate;
+	Com_Memset( &nullstate, 0, sizeof( nullstate ) );
+	for ( int i = 0; i < MAX_GENTITIES; i++ )
+	{
+		entityState_t *base = &cl.entityBaselines[ i ];
+		if ( !base->number )
+			continue;
+		MSG_WriteByte( msg, svc_baseline );
+		MSG_WriteDeltaEntity( msg, &nullstate, base, qtrue );
+	}
+
+	MSG_WriteByte( msg, svc_EOF );
+	MSG_WriteLong( msg, clc.clientNum );
+	MSG_WriteLong( msg, clc.checksumFeed );
+}
+
 #endif // _COD_DEMOTOOL_WRITER_H_

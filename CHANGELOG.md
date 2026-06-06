@@ -9,10 +9,12 @@ Human-friendly summaries of what changed in CoD2-DemoTool.
   map, gametype, length, frame count, players, and the server's hostname. The game
   version is detected automatically from inside the demo.
 - **`--dump`** — write a full per-frame decode to `<demo>.log` for debugging.
-- **Encoder** (`src/writer.h`) — all the bit-level write primitives and delta
-  encoders (entity, client, playerstate, hud, objective), written as the exact
-  inverse of the decoder. This is the groundwork for writing edited demos back out.
-  Not yet attached to a command.
+- **Encoder** (`src/writer.h`) — all the bit-level write primitives, delta encoders
+  (entity, client, playerstate, hud, objective), and the snapshot/gamestate message
+  builders, written as the exact inverse of the decoder.
+- **`--copy`** — re-encode a demo unchanged, frame by frame, into a new playable
+  demo. The round-trip that proves the writer: every frame transcodes, the output
+  re-parses identically, and it lands within ~1% of the original size.
 
 ### Notes
 - A single binary reads demos from **every CoD2 version** — 1.0, 1.2, 1.3, and
@@ -23,6 +25,5 @@ Human-friendly summaries of what changed in CoD2-DemoTool.
   encoder ported from the reverse-engineered CoD2 server (CoD2rev_Server).
 
 ### Next
-- **`--copy`** — re-encode a demo unchanged and confirm the output plays identically
-  in CoD2. This proves the writer before any editing is added.
+- Confirm a `--copy` plays identically in an actual CoD2 client (in-game test).
 - **`--skip-dead`** / **`--cut`** — the actual editing features.

@@ -37,10 +37,15 @@ void Com_Error(int err, char* fmt,...)
 	//exit(1);
 }
 
+int g_quietLog = 0;   // when set, Com_Printf is a no-op (--copy avoids per-call fopen of the log)
+
 void Com_Printf( const char *fmt, ...)
 {
 	va_list		argptr;
 	char		msg[MAXPRINTMSG];
+
+	if ( g_quietLog )
+		return;
 
 	va_start (argptr,fmt);
 	Q_vsnprintf (msg, sizeof(msg), fmt, argptr);
@@ -2466,12 +2471,160 @@ static int Cmd_Dump( const char *path )
 	return 0;
 }
 
+// Read the next demo frame's raw bytes ([seq][len][len bytes]); 0 at EOF.
+static int Demo_ReadRawFrame( FILE *f, int *outSeq, byte *buf, int *outLen )
+{
+	int s, len;
+	if ( fread( &s, 4, 1, f ) != 1 ) return 0;
+	s = LittleLong( s );
+	if ( fread( &len, 4, 1, f ) != 1 ) return 0;
+	len = LittleLong( len );
+	if ( len == -1 || s == -1 ) return 0;            // EOF marker
+	if ( len <= 0 || len > MAX_MSGLEN ) return 0;
+	if ( (int)fread( buf, 1, len, f ) != len ) return 0;
+	*outSeq = s;
+	*outLen = len;
+	return 1;
+}
+
+// Write one re-encoded frame: [seq][len][reliableAck + Huffman(payload)].
+static void Demo_WriteFrame( FILE *f, int seq, int reliableAck, const byte *payload, int payloadLen )
+{
+	static byte compressed[ MAX_MSGLEN ];
+	int compSize = MSG_WriteBitsCompress( payload, compressed, payloadLen );
+	int len = 4 + compSize;
+	int v;
+	v = LittleLong( seq );         fwrite( &v, 4, 1, f );
+	v = LittleLong( len );         fwrite( &v, 4, 1, f );
+	v = LittleLong( reliableAck ); fwrite( &v, 4, 1, f );
+	fwrite( compressed, 1, compSize, f );
+}
+
+// Transcode one frame: decode each svc command (updating decoder state) and emit
+// the equivalent into a fresh uncompressed message, then frame it to `out`.
+static int Demo_TranscodeFrame( const byte *frame, int frameLen, FILE *out, int seq )
+{
+	msg_t in;
+	MSG_Init( &in, (byte *)frame, frameLen );
+	in.cursize = frameLen;
+
+	int reliableAck = MSG_ReadLong( &in );
+
+	static byte dbuf[ MAX_MSGLEN ];
+	msg_t dmsg;
+	MSG_Init( &dmsg, dbuf, sizeof( dbuf ) );
+	dmsg.cursize = MSG_ReadBitsCompress( in.data + in.readcount, in.cursize - in.readcount, dmsg.data, dmsg.maxsize );
+
+	static byte obuf[ MAX_MSGLEN ];
+	msg_t omsg;
+	MSG_Init( &omsg, obuf, sizeof( obuf ) );
+
+	while ( 1 )
+	{
+		if ( dmsg.readcount > dmsg.cursize )
+			return 0;
+		int cmd = MSG_ReadByte( &dmsg );
+
+		if ( cmd == svc_EOF )
+		{
+			MSG_WriteByte( &omsg, svc_EOF );
+			break;
+		}
+
+		switch ( cmd )
+		{
+		case svc_nop:
+			MSG_WriteByte( &omsg, svc_nop );
+			break;
+
+		case svc_serverCommand:
+		{
+			int cseq = MSG_ReadLong( &dmsg );
+			char *s = MSG_ReadBigString( &dmsg );
+			if ( cseq > clc.serverCommandSequence )
+				clc.serverCommandSequence = cseq;
+			MSG_WriteByte( &omsg, svc_serverCommand );
+			MSG_WriteLong( &omsg, cseq );
+			MSG_WriteBigStringRaw( &omsg, s );
+			break;
+		}
+
+		case svc_gamestate:
+			CL_ParseGamestate( &dmsg );
+			SV_WriteGameState( &omsg );
+			break;
+
+		case svc_snapshot:
+			CL_ParseSnapshot( &dmsg );
+			SV_WriteSnapshot( &cl.snap, &omsg );
+			break;
+
+		default:
+			return 0;     // svc_download / unknown — not expected in a playable demo
+		}
+	}
+
+	if ( omsg.overflowed )
+		return 0;
+
+	Demo_WriteFrame( out, seq, reliableAck, omsg.data, omsg.cursize );
+	return 1;
+}
+
+// --copy : round-trip a demo through decode->encode. Proves the writer.
+static int Cmd_Copy( const char *inPath, const char *outPath )
+{
+	snprintf( logFileName, sizeof( logFileName ), "%s.copy.log", inPath );
+	FILE *lf = fopen( logFileName, "w" ); if ( lf ) fclose( lf );
+	g_quietLog = 1;   // silence the decoder's per-command logging
+
+	if ( !FS_FOpenFileRead( inPath, &demo.demofile, qtrue ) || !demo.demofile )
+	{
+		printf( "error: cannot open '%s'\n", inPath );
+		return 1;
+	}
+	FILE *out = fopen( outPath, "wb" );
+	if ( !out )
+	{
+		printf( "error: cannot write '%s'\n", outPath );
+		fclose( demo.demofile );
+		return 1;
+	}
+
+	static byte frame[ MAX_MSGLEN ];
+	int seq, len, frames = 0, bad = 0;
+
+	while ( Demo_ReadRawFrame( demo.demofile, &seq, frame, &len ) )
+	{
+		clc.serverMessageSequence = seq;
+		int r = Demo_TranscodeFrame( frame, len, out, seq );
+		if ( r != 1 ) { bad++; if ( bad <= 3 ) { g_quietLog = 0; printf( "  frame %d (seq %d) failed to transcode\n", frames, seq ); g_quietLog = 1; } }
+		frames++;
+	}
+
+	// EOF marker
+	int eof = -1;
+	fwrite( &eof, 4, 1, out );
+	fwrite( &eof, 4, 1, out );
+
+	fclose( out );
+	fclose( demo.demofile );
+	demo.demofile = NULL;
+	g_quietLog = 0;
+
+	printf( "copied %d frames", frames );
+	if ( bad ) printf( "  (%d failed)", bad );
+	printf( "  ->  %s\n", outPath );
+	return bad ? 1 : 0;
+}
+
 static void Usage( void )
 {
-	printf( "CoD-DemoTool - offline CoD2 .dm_1 demo editor (all versions)\n\n" );
+	printf( "CoD2-DemoTool - offline CoD2 .dm_1 demo editor (all versions)\n\n" );
 	printf( "usage:\n" );
-	printf( "  cod-demotool --info  <demo.dm_1>     show what a demo is (version, map, length)\n" );
-	printf( "  cod-demotool --dump  <demo.dm_1>     write a verbose per-frame log (debug)\n\n" );
+	printf( "  cod2-demotool --info  <demo.dm_1>            show what a demo is (version, map, length)\n" );
+	printf( "  cod2-demotool --dump  <demo.dm_1>            write a verbose per-frame log (debug)\n" );
+	printf( "  cod2-demotool --copy  <in.dm_1> <out.dm_1>   re-encode unchanged (round-trip proof)\n\n" );
 	printf( "  (--skip-dead and --cut arrive in later checkpoints)\n" );
 }
 
@@ -2479,19 +2632,32 @@ int main( int argc, char **argv )
 {
 	const char *mode = "--info";
 	const char *path = NULL;
+	const char *path2 = NULL;
 
 	for ( int i = 1; i < argc; i++ )
 	{
 		if ( argv[ i ][ 0 ] == '-' )
 			mode = argv[ i ];
-		else
+		else if ( !path )
 			path = argv[ i ];
+		else
+			path2 = argv[ i ];
 	}
 
 	if ( !path )
 	{
 		Usage();
 		return 1;
+	}
+
+	if ( !strcmp( mode, "--copy" ) )
+	{
+		if ( !path2 )
+		{
+			printf( "usage: cod2-demotool --copy <in.dm_1> <out.dm_1>\n" );
+			return 1;
+		}
+		return Cmd_Copy( path, path2 );
 	}
 
 	if ( !strcmp( mode, "--dump" ) )
