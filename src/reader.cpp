@@ -1277,7 +1277,7 @@ void MSG_ReadDeltaStruct(msg_t* msg, const void* from, void* to, unsigned int nu
 
 	// check for a remove
 	if (MSG_ReadBit(msg) == 1) {
-		Com_Printf("%3i: #%-3i remove\n", msg->readcount, number);
+		*(uint32_t*)to = (1 << indexBits) - 1;   // mark removed (1023 ents / 63 clients) so the caller drops it
 		return;
 	}
 
@@ -1788,7 +1788,7 @@ void CL_ParsePacketClients( msg_t *msg, clSnapshot_t *oldframe, clSnapshot_t *ne
 			oldnum = 99999;
 		} else {
 			oldstate = &cl.parseClients[
-				( oldframe->parseClientsNum + oldindex ) & ( MAX_PARSE_ENTITIES - 1 )];
+				( oldframe->parseClientsNum + oldindex ) & ( MAX_PARSE_CLIENTS - 1 )];
 			oldnum = oldstate->number;
 		}
 	}
@@ -1826,7 +1826,7 @@ void CL_ParsePacketClients( msg_t *msg, clSnapshot_t *oldframe, clSnapshot_t *ne
 				oldnum = 99999;
 			} else {
 				oldstate = &cl.parseClients[
-					( oldframe->parseClientsNum + oldindex ) & ( MAX_PARSE_ENTITIES - 1 )];
+					( oldframe->parseClientsNum + oldindex ) & ( MAX_PARSE_CLIENTS - 1 )];
 				oldnum = oldstate->number;
 			}
 		}
@@ -1858,7 +1858,7 @@ void CL_ParsePacketClients( msg_t *msg, clSnapshot_t *oldframe, clSnapshot_t *ne
 				oldnum = 99999;
 			} else {
 				oldstate = &cl.parseClients[
-					( oldframe->parseClientsNum + oldindex ) & ( MAX_PARSE_ENTITIES - 1 )];
+					( oldframe->parseClientsNum + oldindex ) & ( MAX_PARSE_CLIENTS - 1 )];
 				oldnum = oldstate->number;
 			}
 			continue;
@@ -1900,7 +1900,7 @@ void CL_ParsePacketClients( msg_t *msg, clSnapshot_t *oldframe, clSnapshot_t *ne
 			oldnum = 99999;
 		} else {
 			oldstate = &cl.parseClients[
-				( oldframe->parseClientsNum + oldindex ) & ( MAX_PARSE_ENTITIES - 1 )];
+				( oldframe->parseClientsNum + oldindex ) & ( MAX_PARSE_CLIENTS - 1 )];
 			oldnum = oldstate->number;
 		}
 	}
@@ -2401,7 +2401,8 @@ static int DecodeDemo( const char *path, bool dump,
 		if ( dump )
 		{
 			Com_Printf( "-------------------------\n" );
-			Com_Printf( "serverTime: %i  Clients: %i\n", cl.snap.serverTime, snapshot.numClients );
+			Com_Printf( "serverTime: %i  cmdTime: %i  deltaTime: %i  Clients: %i\n",
+				cl.snap.serverTime, cl.snap.ps.commandTime, cl.snap.ps.deltaTime, snapshot.numClients );
 			for ( int i = 0; i < snapshot.numClients; i++ )
 			{
 				clientState_t client = snapshot.clients[ i ];
@@ -2410,6 +2411,13 @@ static int DecodeDemo( const char *path, bool dump,
 			playerState_t ps = snapshot.ps;
 			Com_Printf( "Playerstate: clientNum: %3i, weapon: %2i, origin: %f %f %f\n",
 				ps.clientNum, ps.weapon, ps.origin[ 0 ], ps.origin[ 1 ], ps.origin[ 2 ] );
+			for ( int e = 0; e < cl.snap.numEntities; e++ )
+			{
+				entityState_t *es = &cl.parseEntities[ ( cl.snap.parseEntitiesNum + e ) & ( MAX_PARSE_ENTITIES - 1 ) ];
+				Com_Printf( "ENT st=%i ne=%i num=%i eType=%i loop=%i time=%i time2=%i trTime=%i\n",
+					cl.snap.serverTime, cl.snap.numEntities, es->number, es->eType, es->loopSound,
+					es->time, es->time2, es->pos.trTime );
+			}
 		}
 	}
 
@@ -2471,6 +2479,20 @@ static int Cmd_Dump( const char *path )
 	return 0;
 }
 
+// pm_type values (engine: PM_NORMAL=0 .. PM_DEAD=6, PM_DEAD_LINKED=7).
+#define PM_NORMAL_LINKED 1
+#define PM_DEAD          6
+
+// Skip-dead running state, threaded through the transcoder (NULL = plain copy).
+typedef struct
+{
+	int timeOffset;            // cumulative ms removed so far
+	int inDeadSpan;            // currently inside a death->respawn span
+	int deathTime;             // serverTime the current dead span began
+	int dropped;               // frames dropped
+	int forceFulls;            // cut/rebase frames emitted (delta base is the previous kept frame)
+} skipState_t;
+
 // Read the next demo frame's raw bytes ([seq][len][len bytes]); 0 at EOF.
 static int Demo_ReadRawFrame( FILE *f, int *outSeq, byte *buf, int *outLen )
 {
@@ -2500,9 +2522,17 @@ static void Demo_WriteFrame( FILE *f, int seq, int reliableAck, const byte *payl
 	fwrite( compressed, 1, compSize, f );
 }
 
+// Skip-dead keeps the last two materialised output frames (ping-pong) so each kept
+// frame can delta from the previous KEPT one. Reset by Cmd_SkipDead.
+static storedFrame_t g_sf[ 2 ];
+static int           g_sfCur   = 0;
+static qboolean      g_sfValid = qfalse;
+
 // Transcode one frame: decode each svc command (updating decoder state) and emit
 // the equivalent into a fresh uncompressed message, then frame it to `out`.
-static int Demo_TranscodeFrame( const byte *frame, int frameLen, FILE *out, int seq )
+// `skip` NULL = exact copy; non-NULL = skip-dead (drop dead frames, re-time).
+// Returns 1 = written, 0 = dropped (skip-dead), -1 = error.
+static int Demo_TranscodeFrame( const byte *frame, int frameLen, FILE *out, int seq, skipState_t *skip )
 {
 	msg_t in;
 	MSG_Init( &in, (byte *)frame, frameLen );
@@ -2519,10 +2549,12 @@ static int Demo_TranscodeFrame( const byte *frame, int frameLen, FILE *out, int 
 	msg_t omsg;
 	MSG_Init( &omsg, obuf, sizeof( obuf ) );
 
+	int dropFrame = 0;
+
 	while ( 1 )
 	{
 		if ( dmsg.readcount > dmsg.cursize )
-			return 0;
+			return -1;
 		int cmd = MSG_ReadByte( &dmsg );
 
 		if ( cmd == svc_EOF )
@@ -2555,17 +2587,58 @@ static int Demo_TranscodeFrame( const byte *frame, int frameLen, FILE *out, int 
 			break;
 
 		case svc_snapshot:
+		{
 			CL_ParseSnapshot( &dmsg );
-			SV_WriteSnapshot( &cl.snap, &omsg );
+
+			if ( !skip )
+			{
+				SV_WriteSnapshot( &cl.snap, &omsg, 0, qfalse );   // --copy
+				break;
+			}
+
+			int pm = cl.snap.ps.pm_type;
+			int hp = cl.snap.ps.stats[ STAT_HEALTH ];
+			int t  = cl.snap.serverTime;
+			int dead    = ( pm >= PM_DEAD );
+			int playing = ( pm <= PM_NORMAL_LINKED ) && hp > 0;
+			qboolean isCut = qfalse;
+
+			if ( !skip->inDeadSpan )
+			{
+				if ( dead ) { skip->inDeadSpan = 1; skip->deathTime = t; dropFrame = 1; }
+			}
+			else
+			{
+				if ( playing ) { skip->inDeadSpan = 0; skip->timeOffset += t - skip->deathTime; isCut = qtrue; }
+				else dropFrame = 1;
+			}
+
+			if ( !dropFrame )
+			{
+				storedFrame_t *prev = g_sfValid ? &g_sf[ g_sfCur ^ 1 ] : NULL;
+				storedFrame_t *cur  = &g_sf[ g_sfCur ];
+				if ( !prev ) isCut = qtrue;
+				SkipExtractFrame( cur, skip->timeOffset, isCut );
+				SV_WriteSkipSnapshot( prev, cur, &omsg );
+				g_sfCur ^= 1;
+				g_sfValid = qtrue;
+				if ( isCut ) skip->forceFulls++;
+			}
 			break;
+		}
 
 		default:
-			return 0;     // svc_download / unknown — not expected in a playable demo
+			return -1;     // svc_download / unknown — not expected in a playable demo
 		}
 	}
 
-	if ( omsg.overflowed )
+	if ( dropFrame )
+	{
+		if ( skip ) skip->dropped++;
 		return 0;
+	}
+	if ( omsg.overflowed )
+		return -1;
 
 	Demo_WriteFrame( out, seq, reliableAck, omsg.data, omsg.cursize );
 	return 1;
@@ -2597,7 +2670,7 @@ static int Cmd_Copy( const char *inPath, const char *outPath )
 	while ( Demo_ReadRawFrame( demo.demofile, &seq, frame, &len ) )
 	{
 		clc.serverMessageSequence = seq;
-		int r = Demo_TranscodeFrame( frame, len, out, seq );
+		int r = Demo_TranscodeFrame( frame, len, out, seq, NULL );
 		if ( r != 1 ) { bad++; if ( bad <= 3 ) { g_quietLog = 0; printf( "  frame %d (seq %d) failed to transcode\n", frames, seq ); g_quietLog = 1; } }
 		frames++;
 	}
@@ -2618,14 +2691,127 @@ static int Cmd_Copy( const char *inPath, const char *outPath )
 	return bad ? 1 : 0;
 }
 
+// --skip-dead : drop every death->respawn span and re-time, into a new playable demo.
+static int Cmd_SkipDead( const char *inPath, const char *outPath )
+{
+	snprintf( logFileName, sizeof( logFileName ), "%s.skip.log", inPath );
+	FILE *lf = fopen( logFileName, "w" ); if ( lf ) fclose( lf );
+	g_quietLog = 1;
+
+	if ( !FS_FOpenFileRead( inPath, &demo.demofile, qtrue ) || !demo.demofile )
+	{
+		printf( "error: cannot open '%s'\n", inPath );
+		return 1;
+	}
+	FILE *out = fopen( outPath, "wb" );
+	if ( !out )
+	{
+		printf( "error: cannot write '%s'\n", outPath );
+		fclose( demo.demofile );
+		return 1;
+	}
+
+	skipState_t skip;
+	memset( &skip, 0, sizeof( skip ) );
+	g_sfValid = qfalse;
+	g_sfCur   = 0;
+
+	static byte frame[ MAX_MSGLEN ];
+	int seq, len, kept = 0, err = 0, outSeq = 0;
+
+	while ( Demo_ReadRawFrame( demo.demofile, &seq, frame, &len ) )
+	{
+		clc.serverMessageSequence = seq;
+		int r = Demo_TranscodeFrame( frame, len, out, outSeq, &skip );
+		if ( r == 1 ) { kept++; outSeq++; }
+		else if ( r < 0 ) err++;
+	}
+
+	int eof = -1;
+	fwrite( &eof, 4, 1, out );
+	fwrite( &eof, 4, 1, out );
+
+	fclose( out );
+	fclose( demo.demofile );
+	demo.demofile = NULL;
+	g_quietLog = 0;
+
+	int sec = skip.timeOffset / 1000;
+	printf( "skip-dead: kept %d frames, dropped %d (%d.%03ds removed), %d full/cut frames",
+		kept, skip.dropped, sec, skip.timeOffset % 1000, skip.forceFulls );
+	if ( err ) printf( "  [%d errors]", err );
+	printf( "  ->  %s\n", outPath );
+	return 0;
+}
+
+// --deadscan : diagnostic — show where the local player is dead (pm_type >= PM_DEAD)
+// so we can see the dead/respawn spans skip-dead will remove.
+static int Cmd_DeadScan( const char *path )
+{
+	snprintf( logFileName, sizeof( logFileName ), "%s.scan.log", path );
+	FILE *lf = fopen( logFileName, "w" ); if ( lf ) fclose( lf );
+	g_quietLog = 1;
+
+	if ( !FS_FOpenFileRead( path, &demo.demofile, qtrue ) || !demo.demofile )
+	{
+		printf( "error: cannot open '%s'\n", path );
+		return 1;
+	}
+
+	int firstTime = -1, prevPm = -999;
+	int deadStartMs = -1, spans = 0, deadMs = 0, total = 0;
+
+	while ( CL_ReadDemoMessage() )
+	{
+		snapshot_t snapshot;
+		if ( !CL_GetSnapshot( cl.snap.messageNum, &snapshot ) )
+			continue;
+		total++;
+
+		int t  = cl.snap.serverTime;
+		int pm = cl.snap.ps.pm_type;
+		int hp = cl.snap.ps.stats[ STAT_HEALTH ];
+		if ( firstTime < 0 ) firstTime = t;
+		int rel = t - firstTime;
+		int dead = ( pm >= PM_DEAD );
+
+		if ( pm != prevPm )
+		{
+			g_quietLog = 0;
+			printf( "  t=%5d.%03ds  pm_type=%d %-7s health=%d\n",
+				rel / 1000, rel % 1000, pm, dead ? "(DEAD)" : "(alive)", hp );
+			g_quietLog = 1;
+			prevPm = pm;
+		}
+
+		// A dead span runs from death (pm_type >= PM_DEAD) until the player is
+		// playing again (pm_type 0/1, alive), so it includes the killcam (pm 4).
+		int playing = ( pm <= PM_NORMAL_LINKED ) && hp > 0;
+		if ( deadStartMs < 0 && pm >= PM_DEAD ) deadStartMs = t;
+		if ( deadStartMs >= 0 && playing ) { deadMs += t - deadStartMs; spans++; deadStartMs = -1; }
+	}
+	if ( deadStartMs >= 0 ) { deadMs += cl.snap.serverTime - deadStartMs; spans++; }
+
+	fclose( demo.demofile );
+	demo.demofile = NULL;
+	g_quietLog = 0;
+
+	int totalMs = ( firstTime < 0 ) ? 0 : ( cl.snap.serverTime - firstTime );
+	printf( "\n  %d frames, %d:%02d total\n", total, totalMs / 60000, ( totalMs / 1000 ) % 60 );
+	printf( "  dead spans: %d   dead time: %d.%03ds  (%d%% of demo)\n",
+		spans, deadMs / 1000, deadMs % 1000, totalMs ? ( deadMs * 100 / totalMs ) : 0 );
+	return 0;
+}
+
 static void Usage( void )
 {
 	printf( "CoD2-DemoTool - offline CoD2 .dm_1 demo editor (all versions)\n\n" );
 	printf( "usage:\n" );
 	printf( "  cod2-demotool --info  <demo.dm_1>            show what a demo is (version, map, length)\n" );
 	printf( "  cod2-demotool --dump  <demo.dm_1>            write a verbose per-frame log (debug)\n" );
-	printf( "  cod2-demotool --copy  <in.dm_1> <out.dm_1>   re-encode unchanged (round-trip proof)\n\n" );
-	printf( "  (--skip-dead and --cut arrive in later checkpoints)\n" );
+	printf( "  cod2-demotool --copy       <in.dm_1> <out.dm_1>   re-encode unchanged (round-trip proof)\n" );
+	printf( "  cod2-demotool --skip-dead  <in.dm_1> <out.dm_1>   remove death/respawn dead-time\n\n" );
+	printf( "  (--cut arrives in a later checkpoint)\n" );
 }
 
 int main( int argc, char **argv )
@@ -2660,8 +2846,21 @@ int main( int argc, char **argv )
 		return Cmd_Copy( path, path2 );
 	}
 
+	if ( !strcmp( mode, "--skip-dead" ) )
+	{
+		if ( !path2 )
+		{
+			printf( "usage: cod2-demotool --skip-dead <in.dm_1> <out.dm_1>\n" );
+			return 1;
+		}
+		return Cmd_SkipDead( path, path2 );
+	}
+
 	if ( !strcmp( mode, "--dump" ) )
 		return Cmd_Dump( path );
+
+	if ( !strcmp( mode, "--deadscan" ) )
+		return Cmd_DeadScan( path );
 
 	return Cmd_Info( path );
 }

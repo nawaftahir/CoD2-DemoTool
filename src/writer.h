@@ -26,6 +26,8 @@
 #define STATSBITS_COUNT     6      // playerstate stats change-mask width
 #define OBJSTATE_BITS       3      // objective.state width
 #define HUDELEM_COORD_BIAS  512    // bits == -99 small-int bias (2 bits + byte)
+#define ET_EVENTS           0xA    // entityType: eType >= ET_EVENTS is a one-shot temp/event
+                                   // entity (impact FX, sounds). event id = eType - ET_EVENTS.
 
 // ----------------------------------------------------------------------
 //  A) MSG write primitives  (CoD2rev qcommon/msg_mp.cpp)
@@ -535,8 +537,55 @@ void MSG_WriteDeltaPlayerstate( msg_t *msg, playerState_t *from, playerState_t *
 //     SV_WriteSnapshotToClient / SV_SendClientGameState.
 // ----------------------------------------------------------------------
 
+// Re-timing for skip-dead: shift absolute serverTimes back by `off` ms so the
+// timeline stays continuous after dropped frames.
+//
+// NOTE: CoD2's delta encoding transmits each field's *full absolute value*
+// whenever it changes (it does not send increments) — so an absolute time field
+// must be re-timed on EVERY emitted frame, not just at cut boundaries. We re-time
+// copies of both the delta base and the new state by the same offset, which keeps
+// the changed/unchanged detection intact while writing shifted values.
+// The fields below are absolute serverTimes and must all be shifted (mirrors the
+// engine's archived-snapshot retime, CoD2rev sv_snapshot_mp.cpp). Durations and
+// countdowns (weaponTime, pm_time, *Timer, grenadeTimeLeft, trDuration) are
+// relative and must be left alone. A zero value means "unset" — leave it 0.
+static void RetimePlayerstate( playerState_t *ps, int off )
+{
+	ps->commandTime -= off;
+	ps->deltaTime   -= off;
+	if ( ps->jumpTime )           ps->jumpTime           -= off;
+	if ( ps->foliageSoundTime )   ps->foliageSoundTime   -= off;
+	if ( ps->viewHeightLerpTime ) ps->viewHeightLerpTime -= off;
+	if ( ps->shellshockTime )     ps->shellshockTime     -= off;
+	if ( ps->adsDelayTime )       ps->adsDelayTime       -= off;
+}
+static void RetimeEntity( entityState_t *e, int off )
+{
+	if ( e->pos.trTime )  e->pos.trTime  -= off;
+	if ( e->apos.trTime ) e->apos.trTime -= off;
+	if ( e->time )        e->time        -= off;
+	if ( e->time2 )       e->time2       -= off;
+}
+
+// At a skip-dead cut, persisting entities/playerstate are re-sent as a full
+// snapshot, which jumps their eventSequence past every event that happened during
+// the dropped span — the client would "catch up" by replaying those impact/sound
+// effects. Zero the event DATA (but keep eventSequence) so the skipped slots
+// resolve to EV_NONE and nothing replays; real post-cut events still arrive in
+// the following frames.
+static void ClearEntityEvents( entityState_t *e )
+{
+	for ( int i = 0; i < 4; i++ ) { e->events[ i ] = 0; e->eventParms[ i ] = 0; }
+	e->eventParm = 0;
+}
+static void ClearPlayerstateEvents( playerState_t *ps )
+{
+	for ( int i = 0; i < 4; i++ ) { ps->events[ i ] = 0; ps->eventParms[ i ] = 0; }
+}
+
 // Entity-list delta. Mirrors CL_ParsePacketEntities / SV_EmitPacketEntities.
-void SV_EmitPacketEntities( clSnapshot_t *from, clSnapshot_t *to, msg_t *msg )
+// `timeOffset` re-times entities sent from baseline (new / boundary entities).
+void SV_EmitPacketEntities( clSnapshot_t *from, clSnapshot_t *to, msg_t *msg, int timeOffset, qboolean clearEvents )
 {
 	int from_num = from ? from->numEntities : 0;
 	int to_num   = to->numEntities;
@@ -558,14 +607,30 @@ void SV_EmitPacketEntities( clSnapshot_t *from, clSnapshot_t *to, msg_t *msg )
 			oldnum = oldent->number;
 		}
 
-		if ( newnum == oldnum )
+		if ( newnum == oldnum )                                  // persisting — re-time both sides
 		{
-			MSG_WriteDeltaEntity( msg, oldent, newent, qfalse );  // changed, or nothing if unchanged
+			entityState_t o = *oldent, n = *newent;
+			RetimeEntity( &o, timeOffset );
+			RetimeEntity( &n, timeOffset );
+			MSG_WriteDeltaEntity( msg, &o, &n, qfalse );
 			oldindex++; newindex++;
 		}
-		else if ( newnum < oldnum )
+		else if ( newnum < oldnum )                              // new, from baseline — re-time new
 		{
-			MSG_WriteDeltaEntity( msg, &cl.entityBaselines[ newnum ], newent, qtrue );  // new, from baseline
+			// At a skip-dead cut, never re-introduce a one-shot temp/event entity
+			// (impact FX, sounds): the client would "first-see" it and fire the
+			// effect again. Omit it entirely; real post-cut impacts arrive later
+			// via this same baseline path on a normal frame and fire once.
+			if ( clearEvents && newent->eType >= ET_EVENTS )
+			{
+				newindex++;
+				continue;
+			}
+			entityState_t n = *newent;
+			RetimeEntity( &n, timeOffset );
+			if ( clearEvents )                                   // non-temp entity: clear ring events too
+				ClearEntityEvents( &n );
+			MSG_WriteDeltaEntity( msg, &cl.entityBaselines[ newnum ], &n, qtrue );
 			newindex++;
 		}
 		else
@@ -621,13 +686,15 @@ void SV_EmitPacketClients( clSnapshot_t *from, clSnapshot_t *to, msg_t *msg )
 	MSG_WriteBit0( msg );                                          // no-more-clients
 }
 
-// Full svc_snapshot. Delta base is the decoder's stored frame at deltaNum.
-void SV_WriteSnapshot( clSnapshot_t *snap, msg_t *msg )
+// Full svc_snapshot. `timeOffset` re-times the timeline (0 for an exact copy).
+// `forceFull` emits a self-contained non-delta frame (used at skip-dead cut
+// boundaries, where the original delta base was dropped).
+void SV_WriteSnapshot( clSnapshot_t *snap, msg_t *msg, int timeOffset, qboolean forceFull )
 {
 	clSnapshot_t *old = NULL;
 	int lastframe = 0;
 
-	if ( snap->deltaNum > 0 )
+	if ( !forceFull && snap->deltaNum > 0 )
 	{
 		old = &cl.snapshots[ snap->deltaNum & PACKET_MASK ];
 		if ( old->valid )
@@ -637,12 +704,25 @@ void SV_WriteSnapshot( clSnapshot_t *snap, msg_t *msg )
 	}
 
 	MSG_WriteByte( msg, svc_snapshot );
-	MSG_WriteLong( msg, snap->serverTime );
+	MSG_WriteLong( msg, snap->serverTime - timeOffset );
 	MSG_WriteByte( msg, lastframe );
 	MSG_WriteByte( msg, snap->snapFlags );
 
-	MSG_WriteDeltaPlayerstate( msg, old ? &old->ps : NULL, &snap->ps );
-	SV_EmitPacketEntities( old, snap, msg );
+	playerState_t newps = snap->ps;
+	RetimePlayerstate( &newps, timeOffset );
+	if ( old )
+	{
+		playerState_t oldps = old->ps;
+		RetimePlayerstate( &oldps, timeOffset );          // re-time the delta base too
+		MSG_WriteDeltaPlayerstate( msg, &oldps, &newps );
+	}
+	else
+	{
+		if ( forceFull )                    // skip-dead cut: drop stale local events
+			ClearPlayerstateEvents( &newps );
+		MSG_WriteDeltaPlayerstate( msg, NULL, &newps );
+	}
+	SV_EmitPacketEntities( old, snap, msg, timeOffset, forceFull );
 	SV_EmitPacketClients( old, snap, msg );
 }
 
@@ -678,6 +758,105 @@ void SV_WriteGameState( msg_t *msg )
 	MSG_WriteByte( msg, svc_EOF );
 	MSG_WriteLong( msg, clc.clientNum );
 	MSG_WriteLong( msg, clc.checksumFeed );
+}
+
+// ----------------------------------------------------------------------
+//  D) Skip-dead delta path
+//     Each kept frame is delta'd from the PREVIOUS KEPT frame (re-timed and
+//     materialised into a storedFrame_t), and output frames are renumbered
+//     contiguously. This makes removals propagate correctly across a cut —
+//     a persistent entity (e.g. a looping-FX/sound entity) removed during a
+//     dropped span is naturally emitted as a removal here, instead of being
+//     silently kept alive forever (the old non-delta cut frame's bug).
+// ----------------------------------------------------------------------
+
+typedef struct
+{
+	qboolean valid;
+	int      serverTime;     // already re-timed
+	int      snapFlags;
+	playerState_t ps;
+	int      numEnts;
+	entityState_t ents[ MAX_GENTITIES ];
+	int      numClients;
+	clientState_t clients[ MAX_GCLIENTS ];
+} storedFrame_t;
+
+// Materialise cl.snap into `f`, re-timed by timeOffset. At a cut, drop stale ring
+// events and never carry one-shot temp/event entities across the splice.
+void SkipExtractFrame( storedFrame_t *f, int timeOffset, qboolean isCut )
+{
+	f->valid      = qtrue;
+	f->serverTime = cl.snap.serverTime - timeOffset;
+	f->snapFlags  = cl.snap.snapFlags;
+
+	f->ps = cl.snap.ps;
+	RetimePlayerstate( &f->ps, timeOffset );
+	if ( isCut )
+		ClearPlayerstateEvents( &f->ps );
+
+	f->numEnts = 0;
+	for ( int i = 0; i < cl.snap.numEntities && f->numEnts < MAX_GENTITIES; i++ )
+	{
+		entityState_t *e = &cl.parseEntities[ ( cl.snap.parseEntitiesNum + i ) & ( MAX_PARSE_ENTITIES - 1 ) ];
+		if ( isCut && e->eType >= ET_EVENTS )
+			continue;                          // don't re-introduce a one-shot impact at a cut
+		entityState_t n = *e;
+		RetimeEntity( &n, timeOffset );
+		if ( isCut )
+			ClearEntityEvents( &n );
+		f->ents[ f->numEnts++ ] = n;
+	}
+
+	f->numClients = 0;
+	for ( int i = 0; i < cl.snap.numClients && f->numClients < MAX_GCLIENTS; i++ )
+	{
+		clientState_t *c = &cl.parseClients[ ( cl.snap.parseClientsNum + i ) & ( MAX_PARSE_CLIENTS - 1 ) ];
+		f->clients[ f->numClients++ ] = *c;
+	}
+}
+
+// Entity-list delta between two flat arrays (ascending entity number). Emits a
+// removal for every entity in `from` absent from `to` — the lost-removal fix.
+static void SV_EmitDeltaEntitiesArr( entityState_t *fromE, int fromN, entityState_t *toE, int toN, msg_t *msg )
+{
+	int oi = 0, ni = 0;
+	while ( ni < toN || oi < fromN )
+	{
+		int newnum = ( ni < toN ) ? toE[ ni ].number : 99999;
+		int oldnum = ( oi < fromN ) ? fromE[ oi ].number : 99999;
+		if ( newnum == oldnum )     { MSG_WriteDeltaEntity( msg, &fromE[ oi ], &toE[ ni ], qfalse ); oi++; ni++; }
+		else if ( newnum < oldnum ) { MSG_WriteDeltaEntity( msg, &cl.entityBaselines[ newnum ], &toE[ ni ], qtrue ); ni++; }
+		else                        { MSG_WriteDeltaEntity( msg, &fromE[ oi ], NULL, qtrue ); oi++; }   // removed
+	}
+	MSG_WriteBits( msg, MAX_GENTITIES - 1, GENTITYNUM_BITS );
+}
+
+static void SV_EmitDeltaClientsArr( clientState_t *fromC, int fromN, clientState_t *toC, int toN, msg_t *msg )
+{
+	int oi = 0, ni = 0;
+	while ( ni < toN || oi < fromN )
+	{
+		int newnum = ( ni < toN ) ? toC[ ni ].number : 99999;
+		int oldnum = ( oi < fromN ) ? fromC[ oi ].number : 99999;
+		if ( newnum == oldnum )     { MSG_WriteDeltaClient( msg, &fromC[ oi ], &toC[ ni ], qfalse ); oi++; ni++; }
+		else if ( newnum < oldnum ) { MSG_WriteDeltaClient( msg, NULL, &toC[ ni ], qtrue ); ni++; }
+		else                        { MSG_WriteDeltaClient( msg, &fromC[ oi ], NULL, qtrue ); oi++; }
+	}
+	MSG_WriteBit0( msg );
+}
+
+// Write one skip-dead snapshot: delta `cur` from `prev` (NULL prev => non-delta).
+void SV_WriteSkipSnapshot( storedFrame_t *prev, storedFrame_t *cur, msg_t *msg )
+{
+	qboolean haveDelta = ( prev && prev->valid );
+	MSG_WriteByte( msg, svc_snapshot );
+	MSG_WriteLong( msg, cur->serverTime );
+	MSG_WriteByte( msg, haveDelta ? 1 : 0 );      // delta from the immediately-previous output frame
+	MSG_WriteByte( msg, cur->snapFlags );
+	MSG_WriteDeltaPlayerstate( msg, haveDelta ? &prev->ps : NULL, &cur->ps );
+	SV_EmitDeltaEntitiesArr( haveDelta ? prev->ents : NULL,   haveDelta ? prev->numEnts : 0,   cur->ents,    cur->numEnts,    msg );
+	SV_EmitDeltaClientsArr(  haveDelta ? prev->clients : NULL, haveDelta ? prev->numClients : 0, cur->clients, cur->numClients, msg );
 }
 
 #endif // _COD_DEMOTOOL_WRITER_H_

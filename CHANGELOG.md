@@ -15,6 +15,18 @@ Human-friendly summaries of what changed in CoD2-DemoTool.
 - **`--copy`** — re-encode a demo unchanged, frame by frame, into a new playable
   demo. The round-trip that proves the writer: every frame transcodes, the output
   re-parses identically, and it lands within ~1% of the original size.
+- **`--skip-dead`** — the headline feature: removes every death-to-respawn stretch
+  (including the killcam) and re-times the demo so the action plays back-to-back in
+  an unmodified CoD2 client. A 1:40 match plays in ~1:19; on a 30-minute demo it
+  trims ~100 seconds of dead time. Confirmed in-game.
+- **`--deadscan`** — diagnostic that lists where the player is dead, so you can see
+  exactly what `--skip-dead` will cut before running it.
+
+### Fixed
+- Entities and players that disappeared between frames (a "delta removal") were being
+  decoded as lingering ghost entities instead of being dropped. Re-encoding those
+  ghosts re-triggered their effects — that was the cause of bullet-impact FX and 3D
+  sound looping forever after a cut. Removals now decode correctly, so cuts are clean.
 
 ### Notes
 - A single binary reads demos from **every CoD2 version** — 1.0, 1.2, 1.3, and
@@ -25,5 +37,5 @@ Human-friendly summaries of what changed in CoD2-DemoTool.
   encoder ported from the reverse-engineered CoD2 server (CoD2rev_Server).
 
 ### Next
-- Confirm a `--copy` plays identically in an actual CoD2 client (in-game test).
-- **`--skip-dead`** / **`--cut`** — the actual editing features.
+- **`--cut`** — trim a demo to a chosen time range.
+- DT3 polish: a Windows build, and a friendlier batch workflow.
