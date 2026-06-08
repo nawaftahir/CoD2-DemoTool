@@ -21,12 +21,22 @@ Human-friendly summaries of what changed in CoD2-DemoTool.
   trims ~100 seconds of dead time. Confirmed in-game.
 - **`--deadscan`** — diagnostic that lists where the player is dead, so you can see
   exactly what `--skip-dead` will cut before running it.
+- **`--cut`** — trim a demo to a time range and play it from the start, e.g.
+  `--cut game.dm_1 clip.dm_1 1:30 3:00`. Times are mm:ss from the demo start (or plain
+  seconds), or the words `start` / `end`.
 
 ### Fixed
 - Entities and players that disappeared between frames (a "delta removal") were being
   decoded as lingering ghost entities instead of being dropped. Re-encoding those
   ghosts re-triggered their effects — that was the cause of bullet-impact FX and 3D
   sound looping forever after a cut. Removals now decode correctly, so cuts are clean.
+- **High-player demos (≈30+ players) came out corrupt** — players had wildly wrong
+  animations, and the edited demo could crash on reopen. The client history buffer was
+  far too small (only ~4 frames), so on a busy server it overwrote the very data each
+  frame is built from. Enlarged it to cover the full delta window; high-player demos
+  now edit cleanly. (Also hardened the reader so a malformed demo can never crash it.)
+- HUD element animation timings (fades, scales, moves) are now re-timed across a cut,
+  so on-screen HUD elements stay in sync after dead-time is removed.
 
 ### Notes
 - A single binary reads demos from **every CoD2 version** — 1.0, 1.2, 1.3, and
@@ -37,5 +47,4 @@ Human-friendly summaries of what changed in CoD2-DemoTool.
   encoder ported from the reverse-engineered CoD2 server (CoD2rev_Server).
 
 ### Next
-- **`--cut`** — trim a demo to a chosen time range.
 - DT3 polish: a Windows build, and a friendlier batch workflow.

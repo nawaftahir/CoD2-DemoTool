@@ -3041,7 +3041,11 @@ int msg_hData[256] =
 };
 
 #define MAX_PARSE_ENTITIES	(MAX_GENTITIES*2)
-#define MAX_PARSE_CLIENTS	(MAX_GCLIENTS*2)
+// The parse ring must hold every client referenced as a delta base — a snapshot can
+// delta from up to PACKET_BACKUP frames back, each with up to MAX_GCLIENTS clients.
+// MAX_GCLIENTS*2 (128) only held ~4 frames, so on a high-player demo the ring wrapped
+// and overwrote the delta base, corrupting re-encoded client lists (copy/skip/cut).
+#define MAX_PARSE_CLIENTS	(MAX_GCLIENTS*PACKET_BACKUP*2)
 #define PARSE_ENTITIES_MASK	(MAX_PARSE_ENTITIES-1)
 #define PARSE_CLIENTS_MASK	(MAX_PARSE_CLIENTS-1)
 

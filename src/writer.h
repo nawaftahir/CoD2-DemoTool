@@ -558,6 +558,19 @@ static void RetimePlayerstate( playerState_t *ps, int off )
 	if ( ps->viewHeightLerpTime ) ps->viewHeightLerpTime -= off;
 	if ( ps->shellshockTime )     ps->shellshockTime     -= off;
 	if ( ps->adsDelayTime )       ps->adsDelayTime       -= off;
+
+	// HUD element animation timings are absolute serverTimes — the engine re-times
+	// these in its archived-snapshot path (the "archive" retime). Only the archival
+	// set, exactly as the engine. (No future-clamp: we subtract, so a fade that was
+	// scheduled ahead stays correctly ahead on the shifted timeline.)
+	for ( int i = 0; i < MAX_HUDELEMS_ARCHIVAL; i++ )
+	{
+		hudelem_t *h = &ps->hud.archival[ i ];
+		if ( h->time )           h->time           -= off;
+		if ( h->fadeStartTime )  h->fadeStartTime  -= off;
+		if ( h->scaleStartTime ) h->scaleStartTime -= off;
+		if ( h->moveStartTime )  h->moveStartTime  -= off;
+	}
 }
 static void RetimeEntity( entityState_t *e, int off )
 {

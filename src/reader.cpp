@@ -888,6 +888,10 @@ qboolean    CL_GetSnapshot( int snapshotNumber, snapshot_t *snapshot ) {
 	}
 
 	count = clSnap->numClients;
+	if ( count > MAX_CLIENTS_IN_SNAPSHOT ) {
+		Com_DPrintf( "CL_GetSnapshot: truncated %i clients to %i\n", count, MAX_CLIENTS_IN_SNAPSHOT );
+		count = MAX_CLIENTS_IN_SNAPSHOT;
+	}
 	snapshot->numClients = count;
 	for ( i = 0 ; i < count ; i++ ) {
 		snapshot->clients[i] =
@@ -2483,14 +2487,26 @@ static int Cmd_Dump( const char *path )
 #define PM_NORMAL_LINKED 1
 #define PM_DEAD          6
 
-// Skip-dead running state, threaded through the transcoder (NULL = plain copy).
+// Edit modes for the transcoder's drop/re-time decision.
+#define EDIT_SKIPDEAD 0
+#define EDIT_CUT      1
+
+// Edit running state, threaded through the transcoder (NULL = plain copy).
 typedef struct
 {
-	int timeOffset;            // cumulative ms removed so far
-	int inDeadSpan;            // currently inside a death->respawn span
-	int deathTime;             // serverTime the current dead span began
+	int mode;                  // EDIT_SKIPDEAD or EDIT_CUT
+	int timeOffset;            // ms removed before the current frame (the re-time amount)
 	int dropped;               // frames dropped
 	int forceFulls;            // cut/rebase frames emitted (delta base is the previous kept frame)
+	// skip-dead
+	int inDeadSpan;            // currently inside a death->respawn span
+	int deathTime;             // serverTime the current dead span began
+	// cut
+	int firstTime;             // serverTime of the first snapshot (captured once)
+	int haveFirst;
+	int cutStartMs;            // cut: keep [cutStartMs, cutEndMs] relative to firstTime
+	int cutEndMs;
+	int pastEnd;               // set once we pass cutEndMs so the caller can stop reading
 } skipState_t;
 
 // Read the next demo frame's raw bytes ([seq][len][len bytes]); 0 at EOF.
@@ -2596,21 +2612,33 @@ static int Demo_TranscodeFrame( const byte *frame, int frameLen, FILE *out, int 
 				break;
 			}
 
-			int pm = cl.snap.ps.pm_type;
-			int hp = cl.snap.ps.stats[ STAT_HEALTH ];
-			int t  = cl.snap.serverTime;
-			int dead    = ( pm >= PM_DEAD );
-			int playing = ( pm <= PM_NORMAL_LINKED ) && hp > 0;
+			int t = cl.snap.serverTime;
 			qboolean isCut = qfalse;
+			if ( !skip->haveFirst ) { skip->firstTime = t; skip->haveFirst = 1; }
 
-			if ( !skip->inDeadSpan )
+			if ( skip->mode == EDIT_CUT )
 			{
-				if ( dead ) { skip->inDeadSpan = 1; skip->deathTime = t; dropFrame = 1; }
+				int rel = t - skip->firstTime;
+				if ( rel < skip->cutStartMs || rel > skip->cutEndMs ) dropFrame = 1;
+				if ( rel > skip->cutEndMs ) skip->pastEnd = 1;   // nothing left to keep
+				skip->timeOffset = skip->cutStartMs;             // drop the leading slice, re-time by it
 			}
-			else
+			else // EDIT_SKIPDEAD
 			{
-				if ( playing ) { skip->inDeadSpan = 0; skip->timeOffset += t - skip->deathTime; isCut = qtrue; }
-				else dropFrame = 1;
+				int pm = cl.snap.ps.pm_type;
+				int hp = cl.snap.ps.stats[ STAT_HEALTH ];
+				int dead    = ( pm >= PM_DEAD );
+				int playing = ( pm <= PM_NORMAL_LINKED ) && hp > 0;
+
+				if ( !skip->inDeadSpan )
+				{
+					if ( dead ) { skip->inDeadSpan = 1; skip->deathTime = t; dropFrame = 1; }
+				}
+				else
+				{
+					if ( playing ) { skip->inDeadSpan = 0; skip->timeOffset += t - skip->deathTime; isCut = qtrue; }
+					else dropFrame = 1;
+				}
 			}
 
 			if ( !dropFrame )
@@ -2744,6 +2772,88 @@ static int Cmd_SkipDead( const char *inPath, const char *outPath )
 	return 0;
 }
 
+// Parse a demo timestamp: "M:SS", plain seconds, or the keywords "start" (=0) /
+// "end" (=demo end). Returns milliseconds from the demo start.
+static int parseTimeMs( const char *s )
+{
+	if ( !strcmp( s, "start" ) ) return 0;
+	if ( !strcmp( s, "end" ) )   return 0x7FFFFFFF;
+	const char *colon = strchr( s, ':' );
+	if ( colon )
+		return ( atoi( s ) * 60 + atoi( colon + 1 ) ) * 1000;
+	return atoi( s ) * 1000;
+}
+
+// --cut : keep only [start, end] (mm:ss from the demo start) and re-time so the
+// clip plays from the beginning, into a new playable demo. Reuses the skip-dead
+// delta-from-previous-kept-frame path; the only difference is the drop decision.
+static int Cmd_Cut( const char *inPath, const char *outPath, const char *startArg, const char *endArg )
+{
+	int startMs = parseTimeMs( startArg );
+	int endMs   = parseTimeMs( endArg );
+	if ( endMs <= startMs )
+	{
+		printf( "error: end (%s) must be after start (%s)\n", endArg, startArg );
+		return 1;
+	}
+
+	snprintf( logFileName, sizeof( logFileName ), "%s.cut.log", inPath );
+	FILE *lf = fopen( logFileName, "w" ); if ( lf ) fclose( lf );
+	g_quietLog = 1;
+
+	if ( !FS_FOpenFileRead( inPath, &demo.demofile, qtrue ) || !demo.demofile )
+	{
+		printf( "error: cannot open '%s'\n", inPath );
+		return 1;
+	}
+	FILE *out = fopen( outPath, "wb" );
+	if ( !out )
+	{
+		printf( "error: cannot write '%s'\n", outPath );
+		fclose( demo.demofile );
+		return 1;
+	}
+
+	skipState_t skip;
+	memset( &skip, 0, sizeof( skip ) );
+	skip.mode       = EDIT_CUT;
+	skip.cutStartMs = startMs;
+	skip.cutEndMs   = endMs;
+	g_sfValid = qfalse;
+	g_sfCur   = 0;
+
+	static byte frame[ MAX_MSGLEN ];
+	int seq, len, kept = 0, err = 0, outSeq = 0;
+
+	while ( Demo_ReadRawFrame( demo.demofile, &seq, frame, &len ) )
+	{
+		clc.serverMessageSequence = seq;
+		int r = Demo_TranscodeFrame( frame, len, out, outSeq, &skip );
+		if ( r == 1 ) { kept++; outSeq++; }
+		else if ( r < 0 ) err++;
+		if ( skip.pastEnd ) break;          // everything past the cut end is dropped — stop reading
+	}
+
+	int eof = -1;
+	fwrite( &eof, 4, 1, out );
+	fwrite( &eof, 4, 1, out );
+
+	fclose( out );
+	fclose( demo.demofile );
+	demo.demofile = NULL;
+	g_quietLog = 0;
+
+	printf( "cut: kept %d frames", kept );
+	if ( skip.cutEndMs != 0x7FFFFFFF )
+	{
+		int dur = skip.cutEndMs - skip.cutStartMs;
+		printf( " (%d:%02d)", dur / 60000, ( dur / 1000 ) % 60 );
+	}
+	if ( err ) printf( "  [%d errors]", err );
+	printf( "  ->  %s\n", outPath );
+	return 0;
+}
+
 // --deadscan : diagnostic — show where the local player is dead (pm_type >= PM_DEAD)
 // so we can see the dead/respawn spans skip-dead will remove.
 static int Cmd_DeadScan( const char *path )
@@ -2809,26 +2919,28 @@ static void Usage( void )
 	printf( "usage:\n" );
 	printf( "  cod2-demotool --info  <demo.dm_1>            show what a demo is (version, map, length)\n" );
 	printf( "  cod2-demotool --dump  <demo.dm_1>            write a verbose per-frame log (debug)\n" );
-	printf( "  cod2-demotool --copy       <in.dm_1> <out.dm_1>   re-encode unchanged (round-trip proof)\n" );
-	printf( "  cod2-demotool --skip-dead  <in.dm_1> <out.dm_1>   remove death/respawn dead-time\n\n" );
-	printf( "  (--cut arrives in a later checkpoint)\n" );
+	printf( "  cod2-demotool --copy       <in.dm_1> <out.dm_1>          re-encode unchanged (round-trip proof)\n" );
+	printf( "  cod2-demotool --skip-dead  <in.dm_1> <out.dm_1>          remove death/respawn dead-time\n" );
+	printf( "  cod2-demotool --cut        <in.dm_1> <out.dm_1> <s> <e>  keep only the time range [s, e]\n\n" );
+	printf( "  times are mm:ss from the demo start (or plain seconds), or the words 'start' / 'end'\n" );
+	printf( "  e.g.  cod2-demotool --cut game.dm_1 clip.dm_1 1:30 3:00\n" );
 }
 
 int main( int argc, char **argv )
 {
 	const char *mode = "--info";
-	const char *path = NULL;
-	const char *path2 = NULL;
+	const char *p[ 4 ] = { NULL, NULL, NULL, NULL };
+	int np = 0;
 
 	for ( int i = 1; i < argc; i++ )
 	{
 		if ( argv[ i ][ 0 ] == '-' )
 			mode = argv[ i ];
-		else if ( !path )
-			path = argv[ i ];
-		else
-			path2 = argv[ i ];
+		else if ( np < 4 )
+			p[ np++ ] = argv[ i ];
 	}
+
+	const char *path = p[ 0 ], *path2 = p[ 1 ], *path3 = p[ 2 ], *path4 = p[ 3 ];
 
 	if ( !path )
 	{
@@ -2854,6 +2966,17 @@ int main( int argc, char **argv )
 			return 1;
 		}
 		return Cmd_SkipDead( path, path2 );
+	}
+
+	if ( !strcmp( mode, "--cut" ) )
+	{
+		if ( !path2 || !path3 || !path4 )
+		{
+			printf( "usage: cod2-demotool --cut <in.dm_1> <out.dm_1> <start> <end>\n" );
+			printf( "       times are mm:ss from the demo start (or seconds), or 'start' / 'end'\n" );
+			return 1;
+		}
+		return Cmd_Cut( path, path2, path3, path4 );
 	}
 
 	if ( !strcmp( mode, "--dump" ) )
