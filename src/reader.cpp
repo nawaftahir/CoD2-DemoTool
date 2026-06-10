@@ -40,6 +40,19 @@ void Com_Error(int err, char* fmt,...)
 int g_quietLog = 0;   // when set, Com_Printf is a no-op (--copy avoids per-call fopen of the log)
 int g_dumpCommands = 0;   // when set, CL_ParseCommandString prints each server command (for --commands)
 
+// Chat / announcement / score events collected during decode, drained per frame
+// by --overview so they interleave chronologically with the kills.
+#define OV_MAX_EVENTS 64
+#define OV_CHAT       0
+#define OV_TEAMCHAT   1
+#define OV_ANNOUNCE   2
+#define OV_SCORE_ALLIES 3
+#define OV_SCORE_AXIS   4
+typedef struct { int kind; int value; char text[ 256 ]; } ovEvent_t;
+static ovEvent_t g_ovEvents[ OV_MAX_EVENTS ];
+static int g_ovNumEvents = 0;
+int g_collectEvents = 0;
+
 void Com_Printf( const char *fmt, ...)
 {
 	va_list		argptr;
@@ -2163,26 +2176,59 @@ void CL_ParseCommandString( msg_t *msg ) {
 	index = seq & (MAX_RELIABLE_COMMANDS-1);
 	Q_strncpyz( clc.serverCommands[ index ], s, sizeof( clc.serverCommands[ index ] ) );
 
-	if ( g_dumpCommands )
+	// Engine verbs (CoD2rev SV_GameSendServerCommand call sites):
+	//   h = public chat, i = team chat   ("\x15<name>^<color><message>")
+	//   e = allClientsPrint, f = iprintln, g = iprintlnbold  (announcements;
+	//       payload starts with \x15 for literal text, bare = localization key)
+	//   H = allies team score, G = axis team score   ("H <int>")
+	//   v = set client cvar, cs handled elsewhere.
+	int isChat     = ( s[ 0 ] == 'h' || s[ 0 ] == 'i' ) && s[ 1 ] == ' ';
+	int isAnnounce = ( s[ 0 ] == 'e' || s[ 0 ] == 'f' || s[ 0 ] == 'g' ) && s[ 1 ] == ' ';
+	int isScore    = ( s[ 0 ] == 'H' || s[ 0 ] == 'G' ) && s[ 1 ] == ' ';
+
+	if ( ( isChat || isAnnounce ) && ( g_dumpCommands || g_collectEvents ) )
 	{
-		// Engine verbs (CoD2rev G_SayTo / SV_GameSendServerCommand):
-		//   h = public chat, i = team chat  -> string is "\x15<name>^<color><message>"
-		//   v = set client cvar, g/f = announcements, cs = configstring.
-		if ( ( s[ 0 ] == 'h' || s[ 0 ] == 'i' ) && s[ 1 ] == ' ' )
+		char clean[ 1024 ]; int j = 0;
+		for ( const char *p = s + 2; *p && j < (int)sizeof( clean ) - 1; p++ )
 		{
-			char clean[ 1024 ]; int j = 0;
-			for ( const char *p = s + 2; *p && j < (int)sizeof( clean ) - 1; p++ )
+			if ( *p == '"' || *p == 0x15 ) continue;       // quotes + literal-text marker
+			if ( *p == 0x14 )                              // localized-key marker:
 			{
-				if ( *p == '"' || *p == 0x15 ) continue;   // drop quotes + the chat marker byte
-				clean[ j++ ] = *p;
+				if ( isAnnounce && j ) clean[ j++ ] = ' '; // separate key from preceding text
+				continue;                                  // in chat it sits inside (GAME_DEAD)
 			}
-			clean[ j ] = 0;
+			clean[ j++ ] = *p;
+		}
+		clean[ j ] = 0;
+
+		if ( g_dumpCommands && isChat )
 			printf( "[%8d] CHAT%s %s\n", cl.snap.serverTime, s[ 0 ] == 'i' ? "(team)" : "      ", clean );
-		}
-		else
-		{
+		else if ( g_dumpCommands )
 			printf( "[%8d] #%d  %s\n", cl.snap.serverTime, seq, s );
+
+		if ( g_collectEvents && g_ovNumEvents < OV_MAX_EVENTS )
+		{
+			if ( isChat ) g_ovEvents[ g_ovNumEvents ].kind = ( s[ 0 ] == 'i' ) ? OV_TEAMCHAT : OV_CHAT;
+			else          g_ovEvents[ g_ovNumEvents ].kind = OV_ANNOUNCE;
+			Q_strncpyz( g_ovEvents[ g_ovNumEvents ].text, clean, sizeof( g_ovEvents[ 0 ].text ) );
+			g_ovNumEvents++;
 		}
+	}
+	else if ( isScore && g_collectEvents )
+	{
+		if ( g_ovNumEvents < OV_MAX_EVENTS )
+		{
+			g_ovEvents[ g_ovNumEvents ].kind  = ( s[ 0 ] == 'H' ) ? OV_SCORE_ALLIES : OV_SCORE_AXIS;
+			g_ovEvents[ g_ovNumEvents ].value = atoi( s + 2 );
+			g_ovEvents[ g_ovNumEvents ].text[ 0 ] = 0;
+			g_ovNumEvents++;
+		}
+		if ( g_dumpCommands )
+			printf( "[%8d] #%d  %s\n", cl.snap.serverTime, seq, s );
+	}
+	else if ( g_dumpCommands )
+	{
+		printf( "[%8d] #%d  %s\n", cl.snap.serverTime, seq, s );
 	}
 }
 
@@ -2997,6 +3043,49 @@ static const char *MeansOfDeathName( int mod )
 	}
 }
 
+// Render bare localization keys readably: "MP_SCORE_LIMIT_REACHED" ->
+// "score limit reached". Only rewrites ALL_CAPS_UNDERSCORE tokens; normal text
+// passes through. Output never grows, so in-place via a scratch copy is safe.
+static void PrettifyLocKeys( char *s, int size )
+{
+	char out[ 512 ]; int oj = 0;
+	for ( const char *p = s; *p && oj < (int)sizeof( out ) - 1; )
+	{
+		if ( *p == ' ' ) { out[ oj++ ] = *p++; continue; }
+		const char *start = p;
+		while ( *p && *p != ' ' ) p++;
+		int len = (int)( p - start );
+		int caps = 1, under = 0;
+		for ( int i = 0; i < len; i++ )
+		{
+			char c = start[ i ];
+			if ( c == '_' ) { under = 1; continue; }
+			if ( ( c < 'A' || c > 'Z' ) && ( c < '0' || c > '9' ) ) { caps = 0; break; }
+		}
+		if ( caps && under && len >= 5 )
+		{
+			int i = 0;
+			if      ( !strncmp( start, "GAME_", 5 ) )     i = 5;
+			else if ( !strncmp( start, "MP_", 3 ) )       i = 3;
+			else if ( !strncmp( start, "PLATFORM_", 9 ) ) i = 9;
+			for ( ; i < len && oj < (int)sizeof( out ) - 1; i++ )
+			{
+				char c = start[ i ];
+				if ( c == '_' )                 out[ oj++ ] = ' ';
+				else if ( c >= 'A' && c <= 'Z' ) out[ oj++ ] = c - 'A' + 'a';
+				else                             out[ oj++ ] = c;
+			}
+		}
+		else
+		{
+			for ( int i = 0; i < len && oj < (int)sizeof( out ) - 1; i++ )
+				out[ oj++ ] = start[ i ];
+		}
+	}
+	out[ oj ] = 0;
+	Q_strncpyz( s, out, size );
+}
+
 // --overview : the demo's killfeed. Kills are EV_OBITUARY temp entities
 // (eType = ET_EVENTS+EV_OBITUARY = 208) carrying victim (otherEntityNum),
 // attacker (attackerEntityNum) and eventParm (weapon index, or MOD|0x80).
@@ -3017,8 +3106,12 @@ static int Cmd_Overview( const char *path )
 	static char weapons[ 256 ][ 40 ];
 	int  nWeapons = 0, haveWeapons = 0;
 	int  prevObit[ 64 ], nPrev = 0;
-	int  firstTime = -1, kills = 0;
+	int  firstTime = -1, kills = 0, chats = 0, notes = 0;
+	int  scoreAllies = -999999, scoreAxis = -999999;   // sentinel = not yet seen
+	int  objective = 1;                                // score lines only when score = objectives
 	for ( int i = 0; i < MAX_CLIENTS; i++ ) names[ i ][ 0 ] = 0;
+	g_collectEvents = 1;
+	g_ovNumEvents = 0;
 
 	while ( CL_ReadDemoMessage() )
 	{
@@ -3031,7 +3124,11 @@ static int Cmd_Overview( const char *path )
 		{
 			firstTime = t;
 			const char *si = CL_ConfigString( 0 );
-			printf( "=== %s  -  %s ===\n\n", Info_ValueForKey( si, "mapname" ), Info_ValueForKey( si, "g_gametype" ) );
+			const char *gt = Info_ValueForKey( si, "g_gametype" );
+			// in tdm/dm every kill moves the score — the killfeed already shows that,
+			// so interleaved score lines are only printed for objective gametypes
+			objective = strcmp( gt, "tdm" ) != 0 && strcmp( gt, "dm" ) != 0;
+			printf( "=== %s  -  %s ===\n\n", Info_ValueForKey( si, "mapname" ), gt );
 		}
 		int rel = t - firstTime;
 
@@ -3084,12 +3181,65 @@ static int Cmd_Overview( const char *path )
 		}
 		nPrev = nCur;
 		for ( int k = 0; k < nPrev; k++ ) prevObit[ k ] = curObit[ k ];
+
+		// events collected while decoding this message — interleave at this frame's time
+		for ( int k = 0; k < g_ovNumEvents; k++ )
+		{
+			ovEvent_t *ev = &g_ovEvents[ k ];
+
+			if ( ev->kind == OV_SCORE_ALLIES || ev->kind == OV_SCORE_AXIS )
+			{
+				int *slot = ( ev->kind == OV_SCORE_ALLIES ) ? &scoreAllies : &scoreAxis;
+				int known = ( *slot != -999999 );
+				if ( *slot != ev->value )
+				{
+					*slot = ev->value;
+					if ( objective && known )   // skip the initial sync, report real changes
+						printf( "  %d:%02d  -- score  allies %d : %d axis --\n",
+							rel / 60000, ( rel / 1000 ) % 60,
+							scoreAllies == -999999 ? 0 : scoreAllies,
+							scoreAxis   == -999999 ? 0 : scoreAxis );
+				}
+				continue;
+			}
+
+			char clean[ 512 ];
+			StripColors( clean, ev->text, sizeof( clean ) );
+			PrettifyLocKeys( clean, sizeof( clean ) );
+
+			if ( ev->kind == OV_ANNOUNCE )
+			{
+				printf( "  %d:%02d  * %s\n", rel / 60000, ( rel / 1000 ) % 60, clean );
+				notes++;
+			}
+			else
+			{
+				const char *txt = clean;
+				char buf[ 540 ];
+				if ( !strncmp( txt, "(GAME_DEAD)", 11 ) )
+				{
+					snprintf( buf, sizeof( buf ), "(dead) %s", txt + 11 );
+					txt = buf;
+				}
+				else if ( !strncmp( txt, "(GAME_ALLIES)", 13 ) ) txt += 13;   // "(team)" already shown
+				else if ( !strncmp( txt, "(GAME_AXIS)", 11 ) )   txt += 11;
+				printf( "  %d:%02d  %s%s\n", rel / 60000, ( rel / 1000 ) % 60,
+					ev->kind == OV_TEAMCHAT ? "(team) " : "", txt );
+				chats++;
+			}
+		}
+		g_ovNumEvents = 0;
 	}
 
+	g_collectEvents = 0;
 	fclose( demo.demofile );
 	demo.demofile = NULL;
 	g_quietLog = 0;
-	printf( "\n  %d kills\n", kills );
+	if ( scoreAllies != -999999 || scoreAxis != -999999 )
+		printf( "\n  final score  allies %d : %d axis\n",
+			scoreAllies == -999999 ? 0 : scoreAllies,
+			scoreAxis   == -999999 ? 0 : scoreAxis );
+	printf( "\n  %d kills, %d chat messages, %d announcements\n", kills, chats, notes );
 	return 0;
 }
 

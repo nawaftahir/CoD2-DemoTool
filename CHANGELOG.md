@@ -24,10 +24,12 @@ Human-friendly summaries of what changed in CoD2-DemoTool.
 - **`--commands`** — list every server command in the demo by time (chat, announcements,
   cvar pushes, configstring updates). Player chat is decoded and labelled. This is the
   demo's event channel — the groundwork for a killfeed/chat overview.
-- **`--overview`** — the demo's killfeed: who killed whom, when, and with what (real
-  player and weapon names, plus headshot/melee/suicide/falling deaths). Reads the kill
-  events straight out of the snapshot stream and works on stock and modded demos. The
-  first step toward a full demo overview / highlight finder.
+- **`--overview`** — the demo's full match timeline: the killfeed (who killed whom,
+  when, and with what — real player and weapon names, plus headshot/melee/suicide/
+  falling deaths), with **player chat, server announcements, and team-score changes
+  interleaved in chronological order**, ending with the final score. Reads kills
+  straight out of the snapshot stream and events from the command channel; works on
+  stock and modded demos. The first step toward a full demo overview / highlight finder.
 - **`--cut`** — trim a demo to a time range and play it from the start, e.g.
   `--cut game.dm_1 clip.dm_1 1:30 3:00`. Times are mm:ss from the demo start (or plain
   seconds), or the words `start` / `end`.
