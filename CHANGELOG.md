@@ -21,6 +21,9 @@ Human-friendly summaries of what changed in CoD2-DemoTool.
   trims ~100 seconds of dead time. Confirmed in-game.
 - **`--deadscan`** — diagnostic that lists where the player is dead, so you can see
   exactly what `--skip-dead` will cut before running it.
+- **`--commands`** — list every server command in the demo by time (chat, announcements,
+  cvar pushes, configstring updates). Player chat is decoded and labelled. This is the
+  demo's event channel — the groundwork for a killfeed/chat overview.
 - **`--cut`** — trim a demo to a time range and play it from the start, e.g.
   `--cut game.dm_1 clip.dm_1 1:30 3:00`. Times are mm:ss from the demo start (or plain
   seconds), or the words `start` / `end`.

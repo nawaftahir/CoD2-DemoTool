@@ -38,6 +38,7 @@ void Com_Error(int err, char* fmt,...)
 }
 
 int g_quietLog = 0;   // when set, Com_Printf is a no-op (--copy avoids per-call fopen of the log)
+int g_dumpCommands = 0;   // when set, CL_ParseCommandString prints each server command (for --commands)
 
 void Com_Printf( const char *fmt, ...)
 {
@@ -2161,6 +2162,28 @@ void CL_ParseCommandString( msg_t *msg ) {
 
 	index = seq & (MAX_RELIABLE_COMMANDS-1);
 	Q_strncpyz( clc.serverCommands[ index ], s, sizeof( clc.serverCommands[ index ] ) );
+
+	if ( g_dumpCommands )
+	{
+		// Engine verbs (CoD2rev G_SayTo / SV_GameSendServerCommand):
+		//   h = public chat, i = team chat  -> string is "\x15<name>^<color><message>"
+		//   v = set client cvar, g/f = announcements, cs = configstring.
+		if ( ( s[ 0 ] == 'h' || s[ 0 ] == 'i' ) && s[ 1 ] == ' ' )
+		{
+			char clean[ 1024 ]; int j = 0;
+			for ( const char *p = s + 2; *p && j < (int)sizeof( clean ) - 1; p++ )
+			{
+				if ( *p == '"' || *p == 0x15 ) continue;   // drop quotes + the chat marker byte
+				clean[ j++ ] = *p;
+			}
+			clean[ j ] = 0;
+			printf( "[%8d] CHAT%s %s\n", cl.snap.serverTime, s[ 0 ] == 'i' ? "(team)" : "      ", clean );
+		}
+		else
+		{
+			printf( "[%8d] #%d  %s\n", cl.snap.serverTime, seq, s );
+		}
+	}
 }
 
 
@@ -2913,12 +2936,40 @@ static int Cmd_DeadScan( const char *path )
 	return 0;
 }
 
+// --commands : dump every server command in the demo with its serverTime. This is
+// the gameplay/event channel (chat, killfeed, configstring updates) — the raw
+// material for a killfeed/chat overview and the last un-decoded layer of the format.
+static int Cmd_Commands( const char *path )
+{
+	snprintf( logFileName, sizeof( logFileName ), "%s.cmd.log", path );
+	FILE *lf = fopen( logFileName, "w" ); if ( lf ) fclose( lf );
+	g_quietLog = 1;
+
+	if ( !FS_FOpenFileRead( path, &demo.demofile, qtrue ) || !demo.demofile )
+	{
+		printf( "error: cannot open '%s'\n", path );
+		return 1;
+	}
+
+	printf( "[serverTime]  #seq  command\n" );
+	g_dumpCommands = 1;
+	while ( CL_ReadDemoMessage() )
+		;                                  // decoding prints each new server command
+	g_dumpCommands = 0;
+
+	fclose( demo.demofile );
+	demo.demofile = NULL;
+	g_quietLog = 0;
+	return 0;
+}
+
 static void Usage( void )
 {
 	printf( "CoD2-DemoTool - offline CoD2 .dm_1 demo editor (all versions)\n\n" );
 	printf( "usage:\n" );
 	printf( "  cod2-demotool --info  <demo.dm_1>            show what a demo is (version, map, length)\n" );
 	printf( "  cod2-demotool --dump  <demo.dm_1>            write a verbose per-frame log (debug)\n" );
+	printf( "  cod2-demotool --commands <demo.dm_1>         list the server commands (chat, events) by time\n" );
 	printf( "  cod2-demotool --copy       <in.dm_1> <out.dm_1>          re-encode unchanged (round-trip proof)\n" );
 	printf( "  cod2-demotool --skip-dead  <in.dm_1> <out.dm_1>          remove death/respawn dead-time\n" );
 	printf( "  cod2-demotool --cut        <in.dm_1> <out.dm_1> <s> <e>  keep only the time range [s, e]\n\n" );
@@ -2984,6 +3035,9 @@ int main( int argc, char **argv )
 
 	if ( !strcmp( mode, "--deadscan" ) )
 		return Cmd_DeadScan( path );
+
+	if ( !strcmp( mode, "--commands" ) )
+		return Cmd_Commands( path );
 
 	return Cmd_Info( path );
 }
