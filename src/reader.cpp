@@ -2963,6 +2963,136 @@ static int Cmd_Commands( const char *path )
 	return 0;
 }
 
+// Strip CoD colour codes from a name. Standard codes are ^<digit>; some servers
+// store them doubled (^^NN). Rule: after a run of N carets, drop up to N colour
+// digits — handles both ^3 and ^^33 without eating real digits in a name.
+static void StripColors( char *dst, const char *src, int dstsize )
+{
+	int j = 0;
+	while ( *src && j < dstsize - 1 )
+	{
+		if ( *src == '^' )
+		{
+			int carets = 0;
+			while ( *src == '^' ) { src++; carets++; }
+			while ( carets-- > 0 && *src >= '0' && *src <= '9' ) src++;
+			continue;
+		}
+		dst[ j++ ] = *src++;
+	}
+	dst[ j ] = 0;
+}
+
+// Special means-of-death (eventParm & 0x80) — CoD2rev MOD_ enum.
+static const char *MeansOfDeathName( int mod )
+{
+	switch ( mod )
+	{
+	case 7:  return "melee";
+	case 8:  return "headshot";
+	case 9:  return "crush";
+	case 11: return "falling";
+	case 12: return "suicide";
+	default: return "world";
+	}
+}
+
+// --overview : the demo's killfeed. Kills are EV_OBITUARY temp entities
+// (eType = ET_EVENTS+EV_OBITUARY = 208) carrying victim (otherEntityNum),
+// attacker (attackerEntityNum) and eventParm (weapon index, or MOD|0x80).
+// Player names come from the client states, weapon names from CS_WEAPONS.
+static int Cmd_Overview( const char *path )
+{
+	snprintf( logFileName, sizeof( logFileName ), "%s.ov.log", path );
+	FILE *lf = fopen( logFileName, "w" ); if ( lf ) fclose( lf );
+	g_quietLog = 1;
+
+	if ( !FS_FOpenFileRead( path, &demo.demofile, qtrue ) || !demo.demofile )
+	{
+		printf( "error: cannot open '%s'\n", path );
+		return 1;
+	}
+
+	static char names[ MAX_CLIENTS ][ 32 ];
+	static char weapons[ 256 ][ 40 ];
+	int  nWeapons = 0, haveWeapons = 0;
+	int  prevObit[ 64 ], nPrev = 0;
+	int  firstTime = -1, kills = 0;
+	for ( int i = 0; i < MAX_CLIENTS; i++ ) names[ i ][ 0 ] = 0;
+
+	while ( CL_ReadDemoMessage() )
+	{
+		snapshot_t snap;
+		if ( !CL_GetSnapshot( cl.snap.messageNum, &snap ) )
+			continue;
+		int t = snap.serverTime;
+
+		if ( firstTime < 0 )
+		{
+			firstTime = t;
+			const char *si = CL_ConfigString( 0 );
+			printf( "=== %s  -  %s ===\n\n", Info_ValueForKey( si, "mapname" ), Info_ValueForKey( si, "g_gametype" ) );
+		}
+		int rel = t - firstTime;
+
+		// weapon-name list (CS_WEAPONS = 7) is a space-separated, index-ordered list
+		if ( !haveWeapons && CL_ConfigString( 7 )[ 0 ] )
+		{
+			static char wbuf[ 2048 ];
+			Q_strncpyz( wbuf, CL_ConfigString( 7 ), sizeof( wbuf ) );
+			char *tok = strtok( wbuf, " " );
+			while ( tok && nWeapons < 256 ) { Q_strncpyz( weapons[ nWeapons++ ], tok, 40 ); tok = strtok( NULL, " " ); }
+			haveWeapons = 1;
+		}
+
+		for ( int i = 0; i < snap.numClients; i++ )
+		{
+			clientState_t *c = &snap.clients[ i ];
+			if ( c->number >= 0 && c->number < MAX_CLIENTS )
+				StripColors( names[ c->number ], c->name, 32 );
+		}
+
+		// obituary entities persist several frames — emit each kill only when its
+		// entity first appears (not present in the previous frame).
+		int curObit[ 64 ], nCur = 0;
+		for ( int i = 0; i < snap.numEntities; i++ )
+		{
+			entityState_t *es = &snap.entities[ i ];
+			if ( es->eType != 208 )
+				continue;
+			int num = es->number;
+			if ( nCur < 64 ) curObit[ nCur++ ] = num;
+			int isNew = 1;
+			for ( int k = 0; k < nPrev; k++ ) if ( prevObit[ k ] == num ) { isNew = 0; break; }
+			if ( !isNew )
+				continue;
+
+			int victim = es->otherEntityNum, attacker = es->attackerEntityNum, parm = es->eventParm;
+			const char *vn = ( victim >= 0 && victim < MAX_CLIENTS && names[ victim ][ 0 ] ) ? names[ victim ] : "?";
+			const char *an;
+			if ( attacker >= MAX_CLIENTS )                an = "world";
+			else if ( attacker == victim )                an = "(self)";
+			else an = ( attacker >= 0 && attacker < MAX_CLIENTS && names[ attacker ][ 0 ] ) ? names[ attacker ] : "?";
+
+			char how[ 48 ];
+			if ( parm & 0x80 )                            Q_strncpyz( how, MeansOfDeathName( parm & 0x7f ), sizeof( how ) );
+			else if ( parm >= 0 && parm < nWeapons )      Q_strncpyz( how, weapons[ parm ], sizeof( how ) );
+			else                                          snprintf( how, sizeof( how ), "weapon %d", parm );
+
+			printf( "  %d:%02d  %-18s >> %-18s  [%s]\n", rel / 60000, ( rel / 1000 ) % 60, an, vn, how );
+			kills++;
+		}
+		nPrev = nCur;
+		for ( int k = 0; k < nPrev; k++ ) prevObit[ k ] = curObit[ k ];
+	}
+
+	fclose( demo.demofile );
+	demo.demofile = NULL;
+	g_quietLog = 0;
+	printf( "\n  %d kills\n", kills );
+	return 0;
+}
+
 static void Usage( void )
 {
 	printf( "CoD2-DemoTool - offline CoD2 .dm_1 demo editor (all versions)\n\n" );
@@ -2970,6 +3100,7 @@ static void Usage( void )
 	printf( "  cod2-demotool --info  <demo.dm_1>            show what a demo is (version, map, length)\n" );
 	printf( "  cod2-demotool --dump  <demo.dm_1>            write a verbose per-frame log (debug)\n" );
 	printf( "  cod2-demotool --commands <demo.dm_1>         list the server commands (chat, events) by time\n" );
+	printf( "  cod2-demotool --overview <demo.dm_1>         the demo's killfeed (who killed whom, with what)\n" );
 	printf( "  cod2-demotool --copy       <in.dm_1> <out.dm_1>          re-encode unchanged (round-trip proof)\n" );
 	printf( "  cod2-demotool --skip-dead  <in.dm_1> <out.dm_1>          remove death/respawn dead-time\n" );
 	printf( "  cod2-demotool --cut        <in.dm_1> <out.dm_1> <s> <e>  keep only the time range [s, e]\n\n" );
@@ -3038,6 +3169,9 @@ int main( int argc, char **argv )
 
 	if ( !strcmp( mode, "--commands" ) )
 		return Cmd_Commands( path );
+
+	if ( !strcmp( mode, "--overview" ) )
+		return Cmd_Overview( path );
 
 	return Cmd_Info( path );
 }
