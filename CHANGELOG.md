@@ -27,9 +27,13 @@ Human-friendly summaries of what changed in CoD2-DemoTool.
 - **`--overview`** — the demo's full match timeline: the killfeed (who killed whom,
   when, and with what — real player and weapon names, plus headshot/melee/suicide/
   falling deaths), with **player chat, server announcements, and team-score changes
-  interleaved in chronological order**, ending with the final score. Reads kills
-  straight out of the snapshot stream and events from the command channel; works on
-  stock and modded demos. The first step toward a full demo overview / highlight finder.
+  interleaved in chronological order**, a per-player kills/deaths/headshots table,
+  and the final score. Reads kills straight out of the snapshot stream and events
+  from the command channel; works on stock and modded demos.
+- **HTML match page** — `--overview demo.dm_1 match.html` writes the whole overview
+  as a single self-contained dark-themed HTML page: header with map/score, the player
+  summary table, and the full timeline with **names rendered in their CoD colours**
+  and headshots highlighted. Share or archive a match as one file.
 - **`--cut`** — trim a demo to a time range and play it from the start, e.g.
   `--cut game.dm_1 clip.dm_1 1:30 3:00`. Times are mm:ss from the demo start (or plain
   seconds), or the words `start` / `end`.

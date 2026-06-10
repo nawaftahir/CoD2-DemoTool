@@ -2677,7 +2677,7 @@ static int Demo_TranscodeFrame( const byte *frame, int frameLen, FILE *out, int 
 
 			if ( !skip )
 			{
-				SV_WriteSnapshot( &cl.snap, &omsg, 0, qfalse );   // --copy
+				SV_WriteSnapshot( &cl.snap, &omsg );   // --copy
 				break;
 			}
 
@@ -3086,11 +3086,92 @@ static void PrettifyLocKeys( char *s, int size )
 	Q_strncpyz( s, out, size );
 }
 
+// ---- HTML export (--overview <demo> <out.html>) -------------------------------
+// Timeline rows are accumulated in memory so the page can lead with the summary.
+
+static char *g_htmlRows = NULL;
+static int   g_htmlLen  = 0, g_htmlCap = 0;
+
+static void HtmlAppend( const char *s )
+{
+	int len = (int)strlen( s );
+	if ( g_htmlLen + len + 1 > g_htmlCap )
+	{
+		g_htmlCap = ( g_htmlCap ? g_htmlCap * 2 : 0x10000 );
+		if ( g_htmlCap < g_htmlLen + len + 1 ) g_htmlCap = g_htmlLen + len + 1;
+		g_htmlRows = (char *)realloc( g_htmlRows, g_htmlCap );
+	}
+	memcpy( g_htmlRows + g_htmlLen, s, len + 1 );
+	g_htmlLen += len;
+}
+
+static void HtmlEscape( char *dst, const char *src, int dstsize )
+{
+	int j = 0;
+	for ( ; *src && j < dstsize - 8; src++ )
+	{
+		unsigned char b = (unsigned char)*src;
+		if      ( b == '&' ) { memcpy( dst + j, "&amp;", 5 ); j += 5; }
+		else if ( b == '<' ) { memcpy( dst + j, "&lt;",  4 ); j += 4; }
+		else if ( b == '>' ) { memcpy( dst + j, "&gt;",  4 ); j += 4; }
+		else if ( b >= 0x80 )   // CoD2 names are Latin-1-ish; re-encode as valid UTF-8
+		{
+			dst[ j++ ] = (char)( 0xC0 | ( b >> 6 ) );
+			dst[ j++ ] = (char)( 0x80 | ( b & 0x3F ) );
+		}
+		else dst[ j++ ] = b;
+	}
+	dst[ j ] = 0;
+}
+
+// CoD colour-code palette (^0-^9), tuned for a dark page.
+static const char *g_codColors[ 10 ] =
+{
+	"#7a7a7a", "#ff4d4d", "#4dff4d", "#ffe14d", "#5c8aff",
+	"#4de1ff", "#ff5cf0", "#ececec", "#c8a064", "#9d9d9d"
+};
+
+// Render a raw (colour-coded) name as HTML spans. Handles doubled ^^NN codes.
+static void HtmlColorName( char *dst, const char *src, int dstsize )
+{
+	int j = 0, open = 0;
+	char esc[ 16 ];   // must exceed HtmlEscape's dstsize-8 guard for a 1-char input
+	while ( *src && j < dstsize - 64 )
+	{
+		if ( *src == '^' )
+		{
+			int carets = 0;
+			while ( *src == '^' ) { src++; carets++; }
+			int color = -1;
+			while ( carets-- > 0 && *src >= '0' && *src <= '9' )
+			{
+				if ( color < 0 ) color = *src - '0';
+				src++;
+			}
+			if ( color >= 0 )
+			{
+				if ( open ) { memcpy( dst + j, "</span>", 7 ); j += 7; }
+				j += snprintf( dst + j, dstsize - j, "<span style=\"color:%s\">", g_codColors[ color ] );
+				open = 1;
+			}
+			continue;
+		}
+		{
+			char one[ 2 ] = { *src++, 0 };
+			HtmlEscape( esc, one, sizeof( esc ) );   // escapes &<> and re-encodes high bytes
+			int el = (int)strlen( esc );
+			memcpy( dst + j, esc, el ); j += el;
+		}
+	}
+	if ( open ) { memcpy( dst + j, "</span>", 7 ); j += 7; }
+	dst[ j ] = 0;
+}
+
 // --overview : the demo's killfeed. Kills are EV_OBITUARY temp entities
 // (eType = ET_EVENTS+EV_OBITUARY = 208) carrying victim (otherEntityNum),
 // attacker (attackerEntityNum) and eventParm (weapon index, or MOD|0x80).
 // Player names come from the client states, weapon names from CS_WEAPONS.
-static int Cmd_Overview( const char *path )
+static int Cmd_Overview( const char *path, const char *htmlPath )
 {
 	snprintf( logFileName, sizeof( logFileName ), "%s.ov.log", path );
 	FILE *lf = fopen( logFileName, "w" ); if ( lf ) fclose( lf );
@@ -3103,13 +3184,23 @@ static int Cmd_Overview( const char *path )
 	}
 
 	static char names[ MAX_CLIENTS ][ 32 ];
+	static char rawnames[ MAX_CLIENTS ][ 32 ];         // colour codes kept, for the HTML page
 	static char weapons[ 256 ][ 40 ];
+	static int  stKills[ MAX_CLIENTS ], stDeaths[ MAX_CLIENTS ], stHS[ MAX_CLIENTS ];
+	char mapname[ 64 ] = "", gametype[ 24 ] = "";
 	int  nWeapons = 0, haveWeapons = 0;
 	int  prevObit[ 64 ], nPrev = 0;
-	int  firstTime = -1, kills = 0, chats = 0, notes = 0;
+	int  firstTime = -1, lastTime = 0, kills = 0, chats = 0, notes = 0;
 	int  scoreAllies = -999999, scoreAxis = -999999;   // sentinel = not yet seen
 	int  objective = 1;                                // score lines only when score = objectives
-	for ( int i = 0; i < MAX_CLIENTS; i++ ) names[ i ][ 0 ] = 0;
+	int  html = ( htmlPath != NULL );
+	char row[ 1400 ], h1[ 320 ], h2[ 320 ];
+	for ( int i = 0; i < MAX_CLIENTS; i++ )
+	{
+		names[ i ][ 0 ] = 0; rawnames[ i ][ 0 ] = 0;
+		stKills[ i ] = 0; stDeaths[ i ] = 0; stHS[ i ] = 0;
+	}
+	g_htmlLen = 0;
 	g_collectEvents = 1;
 	g_ovNumEvents = 0;
 
@@ -3124,13 +3215,16 @@ static int Cmd_Overview( const char *path )
 		{
 			firstTime = t;
 			const char *si = CL_ConfigString( 0 );
-			const char *gt = Info_ValueForKey( si, "g_gametype" );
+			Q_strncpyz( mapname,  Info_ValueForKey( si, "mapname" ),    sizeof( mapname ) );
+			Q_strncpyz( gametype, Info_ValueForKey( si, "g_gametype" ), sizeof( gametype ) );
 			// in tdm/dm every kill moves the score — the killfeed already shows that,
 			// so interleaved score lines are only printed for objective gametypes
-			objective = strcmp( gt, "tdm" ) != 0 && strcmp( gt, "dm" ) != 0;
-			printf( "=== %s  -  %s ===\n\n", Info_ValueForKey( si, "mapname" ), gt );
+			objective = strcmp( gametype, "tdm" ) != 0 && strcmp( gametype, "dm" ) != 0;
+			if ( !html )
+				printf( "=== %s  -  %s ===\n\n", mapname, gametype );
 		}
 		int rel = t - firstTime;
+		lastTime = rel;
 
 		// weapon-name list (CS_WEAPONS = 7) is a space-separated, index-ordered list
 		if ( !haveWeapons && CL_ConfigString( 7 )[ 0 ] )
@@ -3146,7 +3240,10 @@ static int Cmd_Overview( const char *path )
 		{
 			clientState_t *c = &snap.clients[ i ];
 			if ( c->number >= 0 && c->number < MAX_CLIENTS )
+			{
 				StripColors( names[ c->number ], c->name, 32 );
+				Q_strncpyz( rawnames[ c->number ], c->name, 32 );
+			}
 		}
 
 		// obituary entities persist several frames — emit each kill only when its
@@ -3172,11 +3269,37 @@ static int Cmd_Overview( const char *path )
 			else an = ( attacker >= 0 && attacker < MAX_CLIENTS && names[ attacker ][ 0 ] ) ? names[ attacker ] : "?";
 
 			char how[ 48 ];
+			int  headshot = ( parm & 0x80 ) && ( parm & 0x7f ) == 8;
 			if ( parm & 0x80 )                            Q_strncpyz( how, MeansOfDeathName( parm & 0x7f ), sizeof( how ) );
 			else if ( parm >= 0 && parm < nWeapons )      Q_strncpyz( how, weapons[ parm ], sizeof( how ) );
 			else                                          snprintf( how, sizeof( how ), "weapon %d", parm );
 
-			printf( "  %d:%02d  %-18s >> %-18s  [%s]\n", rel / 60000, ( rel / 1000 ) % 60, an, vn, how );
+			if ( victim >= 0 && victim < MAX_CLIENTS ) stDeaths[ victim ]++;
+			if ( attacker >= 0 && attacker < MAX_CLIENTS && attacker != victim )
+			{
+				stKills[ attacker ]++;
+				if ( headshot ) stHS[ attacker ]++;
+			}
+
+			if ( html )
+			{
+				if ( attacker >= 0 && attacker < MAX_CLIENTS && rawnames[ attacker ][ 0 ] && attacker != victim )
+					HtmlColorName( h1, rawnames[ attacker ], sizeof( h1 ) );
+				else
+					HtmlEscape( h1, an, sizeof( h1 ) );
+				if ( victim >= 0 && victim < MAX_CLIENTS && rawnames[ victim ][ 0 ] )
+					HtmlColorName( h2, rawnames[ victim ], sizeof( h2 ) );
+				else
+					HtmlEscape( h2, vn, sizeof( h2 ) );
+				snprintf( row, sizeof( row ),
+					"<tr class=\"k\"><td>%d:%02d</td><td>%s <span class=\"arr\">&raquo;</span> %s <span class=\"w%s\">%s</span></td></tr>\n",
+					rel / 60000, ( rel / 1000 ) % 60, h1, h2, headshot ? " hs" : "", how );
+				HtmlAppend( row );
+			}
+			else
+			{
+				printf( "  %d:%02d  %-18s >> %-18s  [%s]\n", rel / 60000, ( rel / 1000 ) % 60, an, vn, how );
+			}
 			kills++;
 		}
 		nPrev = nCur;
@@ -3195,10 +3318,22 @@ static int Cmd_Overview( const char *path )
 				{
 					*slot = ev->value;
 					if ( objective && known )   // skip the initial sync, report real changes
-						printf( "  %d:%02d  -- score  allies %d : %d axis --\n",
-							rel / 60000, ( rel / 1000 ) % 60,
-							scoreAllies == -999999 ? 0 : scoreAllies,
-							scoreAxis   == -999999 ? 0 : scoreAxis );
+					{
+						if ( html )
+						{
+							snprintf( row, sizeof( row ),
+								"<tr class=\"s\"><td>%d:%02d</td><td>score &mdash; allies %d : %d axis</td></tr>\n",
+								rel / 60000, ( rel / 1000 ) % 60,
+								scoreAllies == -999999 ? 0 : scoreAllies,
+								scoreAxis   == -999999 ? 0 : scoreAxis );
+							HtmlAppend( row );
+						}
+						else
+							printf( "  %d:%02d  -- score  allies %d : %d axis --\n",
+								rel / 60000, ( rel / 1000 ) % 60,
+								scoreAllies == -999999 ? 0 : scoreAllies,
+								scoreAxis   == -999999 ? 0 : scoreAxis );
+					}
 				}
 				continue;
 			}
@@ -3209,7 +3344,16 @@ static int Cmd_Overview( const char *path )
 
 			if ( ev->kind == OV_ANNOUNCE )
 			{
-				printf( "  %d:%02d  * %s\n", rel / 60000, ( rel / 1000 ) % 60, clean );
+				if ( html )
+				{
+					HtmlEscape( h1, clean, sizeof( h1 ) );
+					snprintf( row, sizeof( row ),
+						"<tr class=\"a\"><td>%d:%02d</td><td>%s</td></tr>\n",
+						rel / 60000, ( rel / 1000 ) % 60, h1 );
+					HtmlAppend( row );
+				}
+				else
+					printf( "  %d:%02d  * %s\n", rel / 60000, ( rel / 1000 ) % 60, clean );
 				notes++;
 			}
 			else
@@ -3223,8 +3367,18 @@ static int Cmd_Overview( const char *path )
 				}
 				else if ( !strncmp( txt, "(GAME_ALLIES)", 13 ) ) txt += 13;   // "(team)" already shown
 				else if ( !strncmp( txt, "(GAME_AXIS)", 11 ) )   txt += 11;
-				printf( "  %d:%02d  %s%s\n", rel / 60000, ( rel / 1000 ) % 60,
-					ev->kind == OV_TEAMCHAT ? "(team) " : "", txt );
+				if ( html )
+				{
+					HtmlEscape( h1, txt, sizeof( h1 ) );
+					snprintf( row, sizeof( row ),
+						"<tr class=\"c\"><td>%d:%02d</td><td>%s%s</td></tr>\n",
+						rel / 60000, ( rel / 1000 ) % 60,
+						ev->kind == OV_TEAMCHAT ? "<span class=\"tc\">(team)</span> " : "", h1 );
+					HtmlAppend( row );
+				}
+				else
+					printf( "  %d:%02d  %s%s\n", rel / 60000, ( rel / 1000 ) % 60,
+						ev->kind == OV_TEAMCHAT ? "(team) " : "", txt );
 				chats++;
 			}
 		}
@@ -3235,10 +3389,83 @@ static int Cmd_Overview( const char *path )
 	fclose( demo.demofile );
 	demo.demofile = NULL;
 	g_quietLog = 0;
+
+	// players sorted by kills for the summary table
+	int order[ MAX_CLIENTS ], nPlayers = 0;
+	for ( int i = 0; i < MAX_CLIENTS; i++ )
+		if ( stKills[ i ] || stDeaths[ i ] )
+			order[ nPlayers++ ] = i;
+	for ( int i = 0; i < nPlayers; i++ )
+		for ( int k = i + 1; k < nPlayers; k++ )
+			if ( stKills[ order[ k ] ] > stKills[ order[ i ] ] )
+			{
+				int tmp = order[ i ]; order[ i ] = order[ k ]; order[ k ] = tmp;
+			}
+
+	if ( html )
+	{
+		FILE *hf = fopen( htmlPath, "w" );
+		if ( !hf )
+		{
+			printf( "error: cannot write '%s'\n", htmlPath );
+			return 1;
+		}
+		fprintf( hf,
+			"<!doctype html>\n<html><head><meta charset=\"utf-8\">\n"
+			"<title>%s - %s</title>\n<style>\n"
+			"body{background:#15171c;color:#cfd3da;font:14px/1.5 'Segoe UI',sans-serif;margin:24px auto;max-width:880px;padding:0 16px}\n"
+			"h1{font-size:20px;color:#fff;margin:0} .meta{color:#8a90a0;margin:4px 0 18px}\n"
+			".score{font-size:16px;color:#fff;background:#22252d;border-radius:8px;padding:10px 16px;display:inline-block;margin-bottom:18px}\n"
+			"table{border-collapse:collapse;width:100%%;margin-bottom:24px}\n"
+			"th{text-align:left;color:#8a90a0;font-weight:600;border-bottom:1px solid #333845;padding:6px 10px}\n"
+			"td{padding:4px 10px;border-bottom:1px solid #20232b;font-family:Consolas,monospace;font-size:13px}\n"
+			"td:first-child{color:#6b7184;width:52px;white-space:nowrap}\n"
+			"tr.c td{color:#9fd49f} tr.a td{color:#d4c98f} tr.s td{color:#7fd4d4;font-weight:600}\n"
+			".arr{color:#6b7184} .w{color:#8a90a0;font-size:12px} .w:before{content:'['} .w:after{content:']'}\n"
+			".hs{color:#ff6b6b} .tc{color:#6b7184}\n"
+			"</style></head><body>\n"
+			"<h1>%s &mdash; %s</h1>\n"
+			"<div class=\"meta\">%s &middot; length %d:%02d &middot; %d kills &middot; %d chat &middot; %d announcements</div>\n",
+			mapname, gametype, mapname, gametype, path,
+			lastTime / 60000, ( lastTime / 1000 ) % 60, kills, chats, notes );
+
+		if ( scoreAllies != -999999 || scoreAxis != -999999 )
+			fprintf( hf, "<div class=\"score\">final score &nbsp; allies %d : %d axis</div>\n",
+				scoreAllies == -999999 ? 0 : scoreAllies,
+				scoreAxis   == -999999 ? 0 : scoreAxis );
+
+		fprintf( hf, "<table><tr><th>player</th><th>kills</th><th>deaths</th><th>headshots</th></tr>\n" );
+		for ( int i = 0; i < nPlayers; i++ )
+		{
+			int c = order[ i ];
+			if ( rawnames[ c ][ 0 ] ) HtmlColorName( h1, rawnames[ c ], sizeof( h1 ) );
+			else                      snprintf( h1, sizeof( h1 ), "client %d", c );
+			fprintf( hf, "<tr><td style=\"width:auto;color:#cfd3da\">%s</td><td>%d</td><td>%d</td><td>%d</td></tr>\n",
+				h1, stKills[ c ], stDeaths[ c ], stHS[ c ] );
+		}
+		fprintf( hf, "</table>\n<table><tr><th>time</th><th>event</th></tr>\n" );
+		if ( g_htmlRows ) fwrite( g_htmlRows, 1, g_htmlLen, hf );
+		fprintf( hf, "</table>\n<div class=\"meta\">generated by CoD2-DemoTool</div>\n</body></html>\n" );
+		fclose( hf );
+		printf( "overview: %d kills, %d chat, %d announcements  ->  %s\n", kills, chats, notes, htmlPath );
+		return 0;
+	}
+
 	if ( scoreAllies != -999999 || scoreAxis != -999999 )
 		printf( "\n  final score  allies %d : %d axis\n",
 			scoreAllies == -999999 ? 0 : scoreAllies,
 			scoreAxis   == -999999 ? 0 : scoreAxis );
+
+	if ( nPlayers )
+	{
+		printf( "\n  %-22s %6s %7s %10s\n", "player", "kills", "deaths", "headshots" );
+		for ( int i = 0; i < nPlayers && i < 16; i++ )
+		{
+			int c = order[ i ];
+			printf( "  %-22s %6d %7d %10d\n",
+				names[ c ][ 0 ] ? names[ c ] : "?", stKills[ c ], stDeaths[ c ], stHS[ c ] );
+		}
+	}
 	printf( "\n  %d kills, %d chat messages, %d announcements\n", kills, chats, notes );
 	return 0;
 }
@@ -3250,7 +3477,7 @@ static void Usage( void )
 	printf( "  cod2-demotool --info  <demo.dm_1>            show what a demo is (version, map, length)\n" );
 	printf( "  cod2-demotool --dump  <demo.dm_1>            write a verbose per-frame log (debug)\n" );
 	printf( "  cod2-demotool --commands <demo.dm_1>         list the server commands (chat, events) by time\n" );
-	printf( "  cod2-demotool --overview <demo.dm_1>         the demo's killfeed (who killed whom, with what)\n" );
+	printf( "  cod2-demotool --overview <demo.dm_1> [out.html]   match timeline: kills, chat, score (HTML optional)\n" );
 	printf( "  cod2-demotool --copy       <in.dm_1> <out.dm_1>          re-encode unchanged (round-trip proof)\n" );
 	printf( "  cod2-demotool --skip-dead  <in.dm_1> <out.dm_1>          remove death/respawn dead-time\n" );
 	printf( "  cod2-demotool --cut        <in.dm_1> <out.dm_1> <s> <e>  keep only the time range [s, e]\n\n" );
@@ -3321,82 +3548,7 @@ int main( int argc, char **argv )
 		return Cmd_Commands( path );
 
 	if ( !strcmp( mode, "--overview" ) )
-		return Cmd_Overview( path );
+		return Cmd_Overview( path, path2 );      // optional second path = write an HTML page
 
 	return Cmd_Info( path );
 }
-
-#if 0  // === legacy CoD2-DemoParser dump main(); superseded by the CLI above. Disabled; remove in DT3 cleanup. ===
-int main_legacy( int argc, char **argv )
-{
-	//printf("Test %d\n", COD_VERSION);
-	//printf("Test %d\n", MAX_MSGLEN);
-	//printf("Test %d\n", sizeof(client_t));
-	//printf("Test %d\n", sizeof(huff_t));
-
-	if( argc < 2 )
-	{
-		Com_Error( ERR_FATAL, "Usage: cod2demo [demofile]\n" );
-	}
-
-	
-	// Log name
-	snprintf(logFileName, sizeof(logFileName), "%s.log", argv[1]);
-
-	// Clear log file
-	FILE *fp = fopen(logFileName, "w");
-	if (fp) {
-		fclose(fp);
-	}
-
-
-
-	FS_FOpenFileRead( argv[1], &demo.demofile, qtrue );
-
-	while (1) {
-		bool exit = CL_ReadDemoMessage();
-
-		if (!exit) break;
-
-
-		snapshot_t snapshot;
-		qboolean ok = CL_GetSnapshot(cl.snap.messageNum, &snapshot);
-
-		if (!ok) continue;
-
-
-
-
-		Com_Printf("-------------------------\n");
-		Com_Printf("Clients: %i\n", snapshot.numClients);
-		for (int i = 0; i < snapshot.numClients; i++) {
-			clientState_t client = snapshot.clients[i];
-			Com_Printf("number: %i, name: %s, team: %i\n", client.number, client.name, client.team);	
-		}
-		/*
-		Com_Printf("-------------------------\n");
-		//Com_Printf("-------------------------");
-		Com_Printf("Entities: %i\n", cl.parseEntitiesNum);
-		for (int i = 0; i < cl.parseEntitiesNum; i++) {
-			entityState_t entity = cl.parseEntities[i];
-			Com_Printf("number: %3i, index: %2i, clientNum: %2i, origin: %f %f %f\n", entity.number, entity.index, entity.clientNum, entity.origin2[0], entity.origin2[1], entity.origin2[2]);	
-		}*/
-		Com_Printf("-------------------------\n");
-		Com_Printf("Playerstate:\n");
-		playerState_t ps = snapshot.ps;
-		Com_Printf("clientNum: %3i, ammoClip: %2i, ammo: %3i, weapon: %2i, origin: %f %f %f\n", 
-			ps.clientNum, ps.ammoclip, ps.ammo, ps.weapon, ps.origin[0], ps.origin[1], ps.origin[2]);
-
-		Com_Printf("\n\n");
-	}
-	
-
-
-	fclose( demo.demofile );
-	
-	Com_Printf("Press any key to exit...\n");
-	int c = fgetc(stdin);  // Read a character from stdin
-
-	return 1;
-}
-#endif  // === end legacy dump main() ===
