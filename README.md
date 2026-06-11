@@ -66,12 +66,22 @@ overview: 260 kills, 21 chat, 15 announcements  ->  match.html
 
 ## Build
 
+Linux:
+
 ```
 g++ -g -m32 -static -Wno-write-strings -DCOD_VERSION=COD2_1_3 src/reader.cpp -o bin/cod2-demotool
 ```
 
-Built `-m32` so struct offsets and bit-field encodings line up with the engine.
-A `Makefile` is included for reference (no `make` required).
+Windows `.exe` (where your demos usually live):
+
+```
+./build-win.sh        # uses a local i686 mingw if present, else a throwaway docker image
+```
+
+The result is a single static `cod2-demotool.exe` — no DLLs to ship. The code is
+plain C stdlib (no POSIX), so the same `-m32` 1.3 layout cross-compiles unchanged.
+Built `-m32` so struct offsets and bit-field encodings line up with the engine. A
+`Makefile` (`make` / `make win`) is included too.
 
 ## How it works
 
