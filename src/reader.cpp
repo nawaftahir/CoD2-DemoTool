@@ -2849,6 +2849,10 @@ static int Cmd_SkipDead( const char *inPath, const char *outPath )
 		kept, skip.dropped, sec, skip.timeOffset % 1000, skip.forceFulls );
 	if ( err ) printf( "  [%d errors]", err );
 	printf( "  ->  %s\n", outPath );
+	// If the demo ended while the player was still dead (never respawned), every
+	// remaining frame was dropped — warn so a truncated tail isn't a surprise.
+	if ( skip.inDeadSpan )
+		printf( "  note: demo ended during a dead span — the tail (no respawn) was removed\n" );
 	return 0;
 }
 
