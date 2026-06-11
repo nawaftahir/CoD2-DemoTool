@@ -2361,8 +2361,18 @@ int CL_ReadDemoMessage( void )
 	return CL_ParseServerMessage( &buf );
 }
 
+// Zero the decoder's global state so a fresh demo doesn't inherit the previous
+// one's parse rings / snapshots / command sequence (needed for batch runs, where
+// several demos are processed in one process).
+void CL_ResetState( void )
+{
+	Com_Memset( &cl, 0, sizeof( cl ) );
+	Com_Memset( &clc, 0, sizeof( clc ) );
+}
+
 int FS_FOpenFileRead( const char *filename, FILE **file, qboolean uniqueFILE )
 {
+	CL_ResetState();
 	*file = fopen( filename, "rb" );
 	return ( *file != NULL );
 }
@@ -2462,7 +2472,8 @@ static int DecodeDemo( const char *path, bool dump,
 		frames++;
 		if ( firstTime < 0 )
 			firstTime = cl.snap.serverTime;
-		lastTime = cl.snap.serverTime;
+		if ( cl.snap.serverTime > lastTime )      // max, not last: serverTime can reset
+			lastTime = cl.snap.serverTime;        // mid-demo (map restart) and go backwards
 
 		for ( int i = 0; i < snapshot.numClients; i++ )
 		{
@@ -3482,24 +3493,68 @@ static void Usage( void )
 	printf( "  cod2-demotool --skip-dead  <in.dm_1> <out.dm_1>          remove death/respawn dead-time\n" );
 	printf( "  cod2-demotool --cut        <in.dm_1> <out.dm_1> <s> <e>  keep only the time range [s, e]\n\n" );
 	printf( "  times are mm:ss from the demo start (or plain seconds), or the words 'start' / 'end'\n" );
-	printf( "  e.g.  cod2-demotool --cut game.dm_1 clip.dm_1 1:30 3:00\n" );
+	printf( "  e.g.  cod2-demotool --cut game.dm_1 clip.dm_1 1:30 3:00\n\n" );
+	printf( "  batch: drop several demos at once -> a summary for each; with --overview, a <demo>.html each\n" );
+}
+
+// Replace a path's extension (or append) with .html — "match.dm_1" -> "match.html".
+static void HtmlPathFor( const char *demo, char *out, int outsize )
+{
+	Q_strncpyz( out, demo, outsize );
+	char *dot = strrchr( out, '.' );
+	char *slash = strrchr( out, '/' );
+	char *bslash = strrchr( out, '\\' );
+	if ( bslash > slash ) slash = bslash;
+	if ( dot && dot > slash ) *dot = 0;
+	int len = (int)strlen( out );
+	snprintf( out + len, outsize - len, ".html" );
 }
 
 int main( int argc, char **argv )
 {
-	const char *mode = "--info";
-	const char *p[ 4 ] = { NULL, NULL, NULL, NULL };
+	const char *mode = NULL;
+	const char *p[ 256 ];
 	int np = 0;
 
 	for ( int i = 1; i < argc; i++ )
 	{
 		if ( argv[ i ][ 0 ] == '-' )
 			mode = argv[ i ];
-		else if ( np < 4 )
+		else if ( np < 256 )
 			p[ np++ ] = argv[ i ];
 	}
 
-	const char *path = p[ 0 ], *path2 = p[ 1 ], *path3 = p[ 2 ], *path4 = p[ 3 ];
+	if ( np == 0 )
+	{
+		Usage();
+		return 1;
+	}
+
+	// Batch / drag-and-drop: several demos dropped on the tool with no explicit
+	// mode -> --info each; with --overview -> write a <demo>.html beside each.
+	if ( np > 1 && ( !mode || !strcmp( mode, "--info" ) || !strcmp( mode, "--overview" ) ) )
+	{
+		int rc = 0, doHtml = ( mode && !strcmp( mode, "--overview" ) );
+		for ( int i = 0; i < np; i++ )
+		{
+			if ( doHtml )
+			{
+				char htmlOut[ 1024 ];
+				HtmlPathFor( p[ i ], htmlOut, sizeof( htmlOut ) );
+				rc |= Cmd_Overview( p[ i ], htmlOut );
+			}
+			else
+			{
+				if ( i ) printf( "\n" );
+				rc |= Cmd_Info( p[ i ] );
+			}
+		}
+		return rc ? 1 : 0;
+	}
+
+	if ( !mode ) mode = "--info";
+	const char *path = p[ 0 ], *path2 = ( np > 1 ) ? p[ 1 ] : NULL;
+	const char *path3 = ( np > 2 ) ? p[ 2 ] : NULL, *path4 = ( np > 3 ) ? p[ 3 ] : NULL;
 
 	if ( !path )
 	{

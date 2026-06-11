@@ -38,7 +38,15 @@ Human-friendly summaries of what changed in CoD2-DemoTool.
   `--cut game.dm_1 clip.dm_1 1:30 3:00`. Times are mm:ss from the demo start (or plain
   seconds), or the words `start` / `end`.
 
+### Added (UX)
+- **Batch / drag-and-drop** — pass several demos at once: with no command you get a
+  one-line summary of each; with `--overview` it writes a `<demo>.html` next to each
+  demo. Handy for dropping a folder of demos onto the tool on Windows.
+
 ### Fixed
+- Demo length and player count were wrong on demos whose serverTime resets mid-recording
+  (e.g. a map restart) — length could even go negative. Length now tracks the peak time,
+  and the decoder is fully reset between demos so a batch run can't carry state across.
 - Entities and players that disappeared between frames (a "delta removal") were being
   decoded as lingering ghost entities instead of being dropped. Re-encoding those
   ghosts re-triggered their effects — that was the cause of bullet-impact FX and 3D
