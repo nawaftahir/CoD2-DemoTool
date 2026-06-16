@@ -1,0 +1,34 @@
+#include <windows.h>
+
+// A version resource makes the .exe look like normal software in Properties->Details
+// and measurably reduces Windows Defender heuristic false-positives on unsigned
+// mingw-built binaries (a blank PE with no metadata scores as more suspicious).
+
+VS_VERSION_INFO VERSIONINFO
+ FILEVERSION    0,2,0,0
+ PRODUCTVERSION 0,2,0,0
+ FILEFLAGSMASK  0x3fL
+ FILEFLAGS      0x0L
+ FILEOS         VOS_NT_WINDOWS32
+ FILETYPE       VFT_APP
+ FILESUBTYPE    VFT2_UNKNOWN
+BEGIN
+    BLOCK "StringFileInfo"
+    BEGIN
+        BLOCK "040904b0"                       // US-English, Unicode
+        BEGIN
+            VALUE "CompanyName",      "Verindra Mod"
+            VALUE "FileDescription",  "CoD2 .dm_1 Demo Tool (offline editor)"
+            VALUE "FileVersion",      "0.2.0.0"
+            VALUE "InternalName",     "cod2-demotool"
+            VALUE "OriginalFilename", "cod2-demotool.exe"
+            VALUE "ProductName",      "CoD2-DemoTool"
+            VALUE "ProductVersion",   "0.2.0.0"
+            VALUE "LegalCopyright",   "Open source - free for non-commercial use"
+        END
+    END
+    BLOCK "VarFileInfo"
+    BEGIN
+        VALUE "Translation", 0x0409, 0x04B0
+    END
+END

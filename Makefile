@@ -24,17 +24,11 @@ $(BIN): $(SRC) src/declarations.hpp src/writer.h
 	@mkdir -p bin
 	$(CXX) $(CXXFLAGS) $(SRC) -o $(BIN)
 
-win: $(SRC) src/declarations.hpp src/writer.h
-	@mkdir -p bin
-	@if command -v $(WINCXX) >/dev/null 2>&1; then \
-		echo "using local mingw"; \
-		$(WINCXX) -g -m32 -static -Wno-write-strings -DCOD_VERSION=COD2_1_3 $(SRC) -o $(WINBIN); \
-	else \
-		echo "no local mingw — cross-building in docker (dockcross/windows-static-x86)"; \
-		docker run --rm -v "$$(pwd)":/work -w /work dockcross/windows-static-x86 \
-			i686-w64-mingw32.static-g++ -g -static -Wno-write-strings -DCOD_VERSION=COD2_1_3 $(SRC) -o $(WINBIN); \
-	fi
-	@echo "built $(WINBIN)"
+# Release exe is -O2 -s (stripped) with an embedded version resource — both reduce
+# Defender heuristic false-positives on an unsigned mingw binary. Delegates to
+# build-win.sh which handles the windres step (local mingw or docker).
+win: $(SRC) src/declarations.hpp src/writer.h src/win/version.rc
+	./build-win.sh
 
 clean:
-	rm -f $(BIN) $(WINBIN)
+	rm -f $(BIN) $(WINBIN) bin/version.o

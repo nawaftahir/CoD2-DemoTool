@@ -83,6 +83,23 @@ plain C stdlib (no POSIX), so the same `-m32` 1.3 layout cross-compiles unchange
 Built `-m32` so struct offsets and bit-field encodings line up with the engine. A
 `Makefile` (`make` / `make win`) is included too.
 
+### Windows trust ("Windows protected your PC")
+
+The `.exe` is **not infected** — Windows flags it because it's brand-new and
+**unsigned**, so SmartScreen has "no reputation" for it yet, and Defender can
+heuristically flag binaries built with the mingw cross-compiler (some malware uses
+mingw too — it's pattern collision, not a real detection). To run it:
+
+- Click **More info → Run anyway** on the SmartScreen prompt (one-time, per version).
+- Or **ship/extract it from a `.zip`** — extracting with Windows' built-in tool drops
+  the "downloaded from the internet" mark, so the prompt usually doesn't appear.
+- If Defender ever quarantines it, submit it to Microsoft's false-positive portal.
+
+The build already embeds a proper version resource and ships stripped (no debug
+sections) to look like normal software and minimize false positives. The only
+permanent silencer is a paid code-signing certificate, which isn't worth it for a
+free offline tool.
+
 ## How it works
 
 - **`src/reader.cpp`** — the decoder. Seeded from the community CoD2-DemoParser
