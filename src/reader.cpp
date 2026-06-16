@@ -40,6 +40,28 @@ void Com_Error(int err, char* fmt,...)
 int g_quietLog = 0;   // when set, Com_Printf is a no-op (--copy avoids per-call fopen of the log)
 int g_dumpCommands = 0;   // when set, CL_ParseCommandString prints each server command (for --commands)
 
+// Server-command filters (Caball-style). Applied during transcode: a dropped
+// command is simply not re-emitted; its sequence number is left as a harmless gap
+// (the client tracks serverCommandSequence as a high-water mark — CL_ParseCommandString
+// dedupes only seq<=current and never waits for a missing intermediate seq).
+int g_removeChat       = 0;   // drop verbs h (public) + i (team)
+int g_removeCenterText = 0;   // drop verb c (Announcement / center print)
+int g_removeWhiteText  = 0;   // drop verbs e/f/g (allClientsPrint / iprintln / iprintlnbold)
+
+// Returns 1 if this server-command string should be dropped by the active filters.
+// s is "<verb> <payload>"; every real text verb has s[1]==' '. Control/state/score
+// verbs (b scoreboard, v cvar, I health, G/H score, o/p/q fades, ...) are NEVER dropped.
+static int CmdShouldDrop( const char *s )
+{
+	if ( !s[ 0 ] || s[ 1 ] != ' ' )
+		return 0;
+	char v = s[ 0 ];
+	if ( g_removeChat       && ( v == 'h' || v == 'i' ) )                 return 1;
+	if ( g_removeCenterText && v == 'c' )                                return 1;
+	if ( g_removeWhiteText  && ( v == 'e' || v == 'f' || v == 'g' ) )     return 1;
+	return 0;
+}
+
 // Chat / announcement / score events collected during decode, drained per frame
 // by --overview so they interleave chronologically with the kills.
 #define OV_MAX_EVENTS 64
@@ -2669,10 +2691,12 @@ static int Demo_TranscodeFrame( const byte *frame, int frameLen, FILE *out, int 
 		{
 			int cseq = MSG_ReadLong( &dmsg );
 			char *s = MSG_ReadBigString( &dmsg );
-			if ( cseq > clc.serverCommandSequence )
+			if ( cseq > clc.serverCommandSequence )      // advance the high-water mark either way
 				clc.serverCommandSequence = cseq;
+			if ( CmdShouldDrop( s ) )                    // filtered out — leave a harmless seq gap
+				break;
 			MSG_WriteByte( &omsg, svc_serverCommand );
-			MSG_WriteLong( &omsg, cseq );
+			MSG_WriteLong( &omsg, cseq );                // keep cseq verbatim — never renumber
 			MSG_WriteBigStringRaw( &omsg, s );
 			break;
 		}
@@ -3495,7 +3519,8 @@ static void Usage( void )
 	printf( "  cod2-demotool --overview <demo.dm_1> [out.html]   match timeline: kills, chat, score (HTML optional)\n" );
 	printf( "  cod2-demotool --copy       <in.dm_1> <out.dm_1>          re-encode unchanged (round-trip proof)\n" );
 	printf( "  cod2-demotool --skip-dead  <in.dm_1> <out.dm_1>          remove death/respawn dead-time\n" );
-	printf( "  cod2-demotool --cut        <in.dm_1> <out.dm_1> <s> <e>  keep only the time range [s, e]\n\n" );
+	printf( "  cod2-demotool --cut        <in.dm_1> <out.dm_1> <s> <e>  keep only the time range [s, e]\n" );
+	printf( "  cod2-demotool --clean      <in.dm_1> <out.dm_1> <what>   strip chat / centertext / whitetext / all\n\n" );
 	printf( "  times are mm:ss from the demo start (or plain seconds), or the words 'start' / 'end'\n" );
 	printf( "  e.g.  cod2-demotool --cut game.dm_1 clip.dm_1 1:30 3:00\n\n" );
 	printf( "  batch: drop several demos at once -> a summary for each; with --overview, a <demo>.html each\n" );
@@ -3584,6 +3609,29 @@ int main( int argc, char **argv )
 			return 1;
 		}
 		return Cmd_SkipDead( path, path2 );
+	}
+
+	// --clean <in> <out> <what...> : strip server-command text (chat / centertext / whitetext).
+	// Just a copy with the filters enabled, so it composes with the round-trip writer.
+	if ( !strcmp( mode, "--clean" ) )
+	{
+		if ( !path2 || !path3 )
+		{
+			printf( "usage: cod2-demotool --clean <in.dm_1> <out.dm_1> <chat|centertext|whitetext|all> ...\n" );
+			return 1;
+		}
+		for ( int i = 2; i < np; i++ )
+		{
+			if ( !strcmp( p[ i ], "chat" )       || !strcmp( p[ i ], "all" ) ) g_removeChat = 1;
+			if ( !strcmp( p[ i ], "centertext" ) || !strcmp( p[ i ], "all" ) ) g_removeCenterText = 1;
+			if ( !strcmp( p[ i ], "whitetext" )  || !strcmp( p[ i ], "all" ) ) g_removeWhiteText = 1;
+		}
+		if ( !g_removeChat && !g_removeCenterText && !g_removeWhiteText )
+		{
+			printf( "  nothing to clean — name at least one of: chat centertext whitetext all\n" );
+			return 1;
+		}
+		return Cmd_Copy( path, path2 );
 	}
 
 	if ( !strcmp( mode, "--cut" ) )

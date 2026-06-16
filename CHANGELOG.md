@@ -37,6 +37,10 @@ Human-friendly summaries of what changed in CoD2-DemoTool.
 - **`--cut`** — trim a demo to a time range and play it from the start, e.g.
   `--cut game.dm_1 clip.dm_1 1:30 3:00`. Times are mm:ss from the demo start (or plain
   seconds), or the words `start` / `end`.
+- **`--clean`** — strip text from a demo: `chat`, `centertext` (big center prints like
+  "airstrike unavailable"), `whitetext` (the bottom-left iprintln feed / connect-leave
+  notices), or `all`. e.g. `--clean game.dm_1 clean.dm_1 chat whitetext`. Scores,
+  scoreboard, cvars and all gameplay are kept — only the chosen text goes.
 
 ### Added (UX)
 - **Batch / drag-and-drop** — pass several demos at once: with no command you get a
