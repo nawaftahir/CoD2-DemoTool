@@ -41,6 +41,12 @@ Human-friendly summaries of what changed in CoD2-DemoTool.
   "airstrike unavailable"), `whitetext` (the bottom-left iprintln feed / connect-leave
   notices), or `all`. e.g. `--clean game.dm_1 clean.dm_1 chat whitetext`. Scores,
   scoreboard, cvars and all gameplay are kept — only the chosen text goes.
+- **`--remove-hud`** — strip the server-set HUD elements (custom overlays, kill cards,
+  server logos) from a demo. Add `keep <shader-name>` to keep matching ones. (The
+  hitmarker and the ammo/score readouts aren't stored in CoD2 demos, so they're
+  unaffected; team-skull head icons live in the entity data and are left alone.)
+- **`--scale-score`** — multiply the value of the "+N" score-popup HUD elements, e.g.
+  `--scale-score game.dm_1 out.dm_1 0.2` to turn +50 into +10.
 
 ### Added (UX)
 - **Batch / drag-and-drop** — pass several demos at once: with no command you get a

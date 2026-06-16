@@ -62,6 +62,80 @@ static int CmdShouldDrop( const char *s )
 	return 0;
 }
 
+// HUD / score-popup mutators (Caball-style). These edit cl.snap.ps in place right
+// after CL_ParseSnapshot, BEFORE the snapshot is stored as the next frame's delta
+// base — so the stored base and the emitted frame agree (else the delta desyncs).
+const char *CL_ConfigString( int index );      // defined below; needed by HudElemKept
+#define CS_SHADERS 1566                         // CoD2rev g_shared.h:1255 — material configstring base
+int    g_removeHud  = 0;       // strip all hud elements (subject to the keep-list below)
+int    g_scaleScore = 0;       // scale HE_TYPE_VALUE score popups
+float  g_scoreMult  = 1.0f;
+const char *g_keepShader = NULL;   // --remove-hud keep <shader-substring>
+
+// Keep a hudelem if a keep-rule matches: its shader name (materialIndex -> CS_SHADERS)
+// contains g_keepShader. Default = drop.
+static int HudElemKept( const hudelem_t *h )
+{
+	if ( g_keepShader && h->materialIndex )
+	{
+		const char *shader = CL_ConfigString( CS_SHADERS + h->materialIndex );
+		if ( shader[ 0 ] && strstr( shader, g_keepShader ) )
+			return 1;
+	}
+	return 0;
+}
+
+// Remove (and COMPACT) hud elements in one array. MSG_WriteDeltaHudElems stops at the
+// first HE_TYPE_FREE, so survivors must be packed from index 0 with a zeroed tail —
+// exactly how the engine fills these arrays.
+static void HudArrayRemove( hudelem_t *arr, int count )
+{
+	int w = 0;
+	for ( int r = 0; r < count; r++ )
+	{
+		if ( arr[ r ].type == HE_TYPE_FREE )
+			break;                                  // already the packed tail
+		if ( HudElemKept( &arr[ r ] ) )
+		{
+			if ( w != r ) arr[ w ] = arr[ r ];
+			w++;
+		}
+	}
+	for ( ; w < count; w++ )
+		memset( &arr[ w ], 0, sizeof( arr[ w ] ) );   // zero the tail (HE_TYPE_FREE)
+}
+
+// Scale a score-popup hudelem in one array: any HE_TYPE_VALUE element's value is
+// multiplied (rounded to nearest, sign preserved). Ammo/timer use other types.
+static void HudArrayScale( hudelem_t *arr, int count, float mult )
+{
+	for ( int i = 0; i < count; i++ )
+	{
+		if ( arr[ i ].type == HE_TYPE_FREE )
+			break;
+		if ( arr[ i ].type == HE_TYPE_VALUE )
+		{
+			float v = arr[ i ].value * mult;
+			arr[ i ].value = (float)(int)( v + ( v >= 0 ? 0.5f : -0.5f ) );
+		}
+	}
+}
+
+// Apply the active hud/score edits to a playerstate (both archival + current arrays).
+static void EditPlayerstateHud( playerState_t *ps )
+{
+	if ( g_removeHud )
+	{
+		HudArrayRemove( ps->hud.archival, MAX_HUDELEMS_ARCHIVAL );
+		HudArrayRemove( ps->hud.current,  MAX_HUDELEMS_CURRENT );
+	}
+	if ( g_scaleScore )
+	{
+		HudArrayScale( ps->hud.archival, MAX_HUDELEMS_ARCHIVAL, g_scoreMult );
+		HudArrayScale( ps->hud.current,  MAX_HUDELEMS_CURRENT,  g_scoreMult );
+	}
+}
+
 // Chat / announcement / score events collected during decode, drained per frame
 // by --overview so they interleave chronologically with the kills.
 #define OV_MAX_EVENTS 64
@@ -2066,6 +2140,11 @@ void CL_ParseSnapshot( msg_t *msg ) {
 	// copy to the current good spot
 	cl.snap = newSnap;
 	cl.snap.ping = 999;
+
+	// HUD / score-popup edits must happen here, before cl.snap is stored as the next
+	// frame's delta base below — so the base and the emitted frame stay in sync.
+	if ( g_removeHud || g_scaleScore )
+		EditPlayerstateHud( &cl.snap.ps );
 	// calculate ping time
 	/*Pfor ( i = 0 ; i < PACKET_BACKUP ; i++ ) {
 		packetNum = ( clc.netchan.outgoingSequence - 1 - i ) & PACKET_MASK;
@@ -3520,7 +3599,9 @@ static void Usage( void )
 	printf( "  cod2-demotool --copy       <in.dm_1> <out.dm_1>          re-encode unchanged (round-trip proof)\n" );
 	printf( "  cod2-demotool --skip-dead  <in.dm_1> <out.dm_1>          remove death/respawn dead-time\n" );
 	printf( "  cod2-demotool --cut        <in.dm_1> <out.dm_1> <s> <e>  keep only the time range [s, e]\n" );
-	printf( "  cod2-demotool --clean      <in.dm_1> <out.dm_1> <what>   strip chat / centertext / whitetext / all\n\n" );
+	printf( "  cod2-demotool --clean      <in.dm_1> <out.dm_1> <what>   strip chat / centertext / whitetext / all\n" );
+	printf( "  cod2-demotool --remove-hud <in.dm_1> <out.dm_1> [keep <shader>]   strip server-set HUD elements\n" );
+	printf( "  cod2-demotool --scale-score <in.dm_1> <out.dm_1> <mult> scale the +N score popups (e.g. 0.2)\n\n" );
 	printf( "  times are mm:ss from the demo start (or plain seconds), or the words 'start' / 'end'\n" );
 	printf( "  e.g.  cod2-demotool --cut game.dm_1 clip.dm_1 1:30 3:00\n\n" );
 	printf( "  batch: drop several demos at once -> a summary for each; with --overview, a <demo>.html each\n" );
@@ -3631,6 +3712,33 @@ int main( int argc, char **argv )
 			printf( "  nothing to clean — name at least one of: chat centertext whitetext all\n" );
 			return 1;
 		}
+		return Cmd_Copy( path, path2 );
+	}
+
+	// --remove-hud <in> <out> [keep <shader-substring>] : strip server-set HUD elements.
+	if ( !strcmp( mode, "--remove-hud" ) )
+	{
+		if ( !path2 )
+		{
+			printf( "usage: cod2-demotool --remove-hud <in.dm_1> <out.dm_1> [keep <shader-substring>]\n" );
+			return 1;
+		}
+		g_removeHud = 1;
+		for ( int i = 2; i + 1 < np; i++ )
+			if ( !strcmp( p[ i ], "keep" ) ) g_keepShader = p[ i + 1 ];
+		return Cmd_Copy( path, path2 );
+	}
+
+	// --scale-score <in> <out> <mult> : scale the +N score-popup hud elements.
+	if ( !strcmp( mode, "--scale-score" ) )
+	{
+		if ( !path2 || !path3 )
+		{
+			printf( "usage: cod2-demotool --scale-score <in.dm_1> <out.dm_1> <multiplier>\n" );
+			return 1;
+		}
+		g_scaleScore = 1;
+		g_scoreMult  = (float)atof( path3 );
 		return Cmd_Copy( path, path2 );
 	}
 
