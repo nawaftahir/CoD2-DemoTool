@@ -50,6 +50,9 @@ Human-friendly summaries of what changed in CoD2-DemoTool.
 - **`--split-map`** / **`--split-match`** — break one recording that spans several maps
   or matches into separate playable demos (`<demo>_map1.dm_1`, `_map2.dm_1`, …). Splits
   at each map change (`--split-map`) or each match/round restart (`--split-match`).
+- **`--convert`** — re-tag a demo's CoD2 version (`--convert game.dm_1 out.dm_1 118`).
+  CoD2's demo format is identical across versions, so this just rewrites the version
+  in the demo so it loads on a client of the target version.
 
 ### Added (UX)
 - **Batch / drag-and-drop** — pass several demos at once: with no command you get a

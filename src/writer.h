@@ -723,7 +723,18 @@ void SV_WriteGameState( msg_t *msg )
 			continue;
 		MSG_WriteByte( msg, svc_configstring );
 		MSG_WriteShort( msg, i );
-		MSG_WriteBigStringRaw( msg, cs );
+		// --convert: rewrite protocol / shortversion in the serverinfo (configstring 0)
+		if ( i == 0 && g_convertProtocol )
+		{
+			char patched[ MAX_STRING_CHARS * 2 ];
+			Q_strncpyz( patched, cs, sizeof( patched ) );
+			char protoStr[ 16 ]; snprintf( protoStr, sizeof( protoStr ), "%d", g_convertProtocol );
+			Info_SetValueForKey( patched, sizeof( patched ), "protocol", protoStr );
+			Info_SetValueForKey( patched, sizeof( patched ), "shortversion", ProtocolShortVersion( g_convertProtocol ) );
+			MSG_WriteBigStringRaw( msg, patched );
+		}
+		else
+			MSG_WriteBigStringRaw( msg, cs );
 	}
 
 	entityState_t nullstate;

@@ -68,6 +68,22 @@ static int CmdShouldDrop( const char *s )
 const char *CL_ConfigString( int index );      // defined below; needed by HudElemKept
 #define CS_SHADERS 1566                         // CoD2rev g_shared.h:1255 — material configstring base
 #define SNAPFLAG_SERVERCOUNT 4                  // CoD2rev q_shared.h:180 — toggled on every map_restart
+
+// Protocol conversion: rewrite the protocol/shortversion in configstring[0] on emit.
+// For CoD2 the wire format is identical across versions, so this is a metadata swap.
+void Info_SetValueForKey( char *s, int dstsize, const char *key, const char *value );  // defined below
+int  g_convertProtocol = 0;                     // 0 = off, else target protocol (115/117/118/119/120)
+const char *ProtocolShortVersion( int proto )
+{
+	switch ( proto )
+	{
+	case 115: return "1.0";
+	case 117: return "1.2";
+	case 118: return "1.3";
+	case 119: case 120: return "1.4";
+	default:  return "";
+	}
+}
 int    g_removeHud  = 0;       // strip all hud elements (subject to the keep-list below)
 int    g_scaleScore = 0;       // scale HE_TYPE_VALUE score popups
 float  g_scoreMult  = 1.0f;
@@ -2546,6 +2562,33 @@ const char *Info_ValueForKey( const char *s, const char *key )
 	}
 }
 
+// Set/replace a key's value in a "\k\v\k\v" info string, in place (dstsize bounded).
+// Used by --convert to rewrite protocol/shortversion in configstring[0] on emit.
+void Info_SetValueForKey( char *s, int dstsize, const char *key, const char *value )
+{
+	char out[ MAX_STRING_CHARS * 2 ]; int j = 0;
+	const char *p = s;
+	int wrote = 0;
+	if ( *p == '\\' ) p++;
+	while ( *p )
+	{
+		char k[ MAX_STRING_CHARS ]; int ki = 0;
+		while ( *p && *p != '\\' && ki < (int)sizeof( k ) - 1 ) k[ ki++ ] = *p++;
+		k[ ki ] = 0;
+		if ( *p == '\\' ) p++;
+		char v[ MAX_STRING_CHARS ]; int vi = 0;
+		while ( *p && *p != '\\' && vi < (int)sizeof( v ) - 1 ) v[ vi++ ] = *p++;
+		v[ vi ] = 0;
+		if ( *p == '\\' ) p++;
+		const char *useV = v;
+		if ( !strcasecmp( k, key ) ) { useV = value; wrote = 1; }
+		j += snprintf( out + j, sizeof( out ) - j, "\\%s\\%s", k, useV );
+	}
+	if ( !wrote )
+		j += snprintf( out + j, sizeof( out ) - j, "\\%s\\%s", key, value );
+	Q_strncpyz( s, out, dstsize );
+}
+
 // Open a demo and run the decode loop. `dump` controls whether the verbose
 // per-frame state is written to <demo>.log. Out-params summarise the demo.
 // Returns 0 on success.
@@ -3887,6 +3930,25 @@ int main( int argc, char **argv )
 
 	if ( !strcmp( mode, "--split-match" ) )
 		return Cmd_Split( path, 1 );
+
+	// --convert <in> <out> <protocol> : re-tag the demo's version (115/117/118/119/120).
+	// CoD2's wire format is identical across versions, so this only rewrites the
+	// protocol/shortversion in the serverinfo configstring.
+	if ( !strcmp( mode, "--convert" ) )
+	{
+		if ( !path2 || !path3 )
+		{
+			printf( "usage: cod2-demotool --convert <in.dm_1> <out.dm_1> <protocol: 115|117|118|119|120>\n" );
+			return 1;
+		}
+		g_convertProtocol = atoi( path3 );
+		if ( !ProtocolShortVersion( g_convertProtocol )[ 0 ] )
+		{
+			printf( "  unknown protocol %s — use 115 (1.0), 117 (1.2), 118 (1.3), 119/120 (1.4)\n", path3 );
+			return 1;
+		}
+		return Cmd_Copy( path, path2 );
+	}
 
 	if ( !strcmp( mode, "--cut" ) )
 	{
