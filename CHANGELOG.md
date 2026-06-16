@@ -47,6 +47,9 @@ Human-friendly summaries of what changed in CoD2-DemoTool.
   unaffected; team-skull head icons live in the entity data and are left alone.)
 - **`--scale-score`** — multiply the value of the "+N" score-popup HUD elements, e.g.
   `--scale-score game.dm_1 out.dm_1 0.2` to turn +50 into +10.
+- **`--split-map`** / **`--split-match`** — break one recording that spans several maps
+  or matches into separate playable demos (`<demo>_map1.dm_1`, `_map2.dm_1`, …). Splits
+  at each map change (`--split-map`) or each match/round restart (`--split-match`).
 
 ### Added (UX)
 - **Batch / drag-and-drop** — pass several demos at once: with no command you get a

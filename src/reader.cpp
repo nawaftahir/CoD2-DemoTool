@@ -67,6 +67,7 @@ static int CmdShouldDrop( const char *s )
 // base — so the stored base and the emitted frame agree (else the delta desyncs).
 const char *CL_ConfigString( int index );      // defined below; needed by HudElemKept
 #define CS_SHADERS 1566                         // CoD2rev g_shared.h:1255 — material configstring base
+#define SNAPFLAG_SERVERCOUNT 4                  // CoD2rev q_shared.h:180 — toggled on every map_restart
 int    g_removeHud  = 0;       // strip all hud elements (subject to the keep-list below)
 int    g_scaleScore = 0;       // scale HE_TYPE_VALUE score popups
 float  g_scoreMult  = 1.0f;
@@ -2959,6 +2960,143 @@ static int Cmd_SkipDead( const char *inPath, const char *outPath )
 	return 0;
 }
 
+// Decode a raw frame just far enough to classify it: is it a gamestate? a snapshot?
+// what is the snapshot's snapFlags? Updates the decoder state (cl) as a side effect,
+// exactly like a normal decode, so cl.gameState is current for the splitter.
+// Returns: 1=gamestate, 2=snapshot, 0=other/empty, -1=error. *outSnapFlags valid for 2.
+static int Demo_ClassifyFrame( const byte *frame, int frameLen, int *outSnapFlags )
+{
+	msg_t in;
+	MSG_Init( &in, (byte *)frame, frameLen );
+	in.cursize = frameLen;
+	MSG_ReadLong( &in );   // reliableAck
+
+	static byte dbuf[ MAX_MSGLEN ];
+	msg_t dmsg;
+	MSG_Init( &dmsg, dbuf, sizeof( dbuf ) );
+	dmsg.cursize = MSG_ReadBitsCompress( in.data + in.readcount, in.cursize - in.readcount, dmsg.data, dmsg.maxsize );
+
+	int kind = 0;
+	while ( 1 )
+	{
+		if ( dmsg.readcount > dmsg.cursize ) return -1;
+		int cmd = MSG_ReadByte( &dmsg );
+		if ( cmd == svc_EOF ) break;
+		switch ( cmd )
+		{
+		case svc_nop: break;
+		case svc_serverCommand: { MSG_ReadLong( &dmsg ); MSG_ReadBigString( &dmsg ); break; }
+		case svc_gamestate: CL_ParseGamestate( &dmsg ); kind = 1; break;
+		case svc_snapshot:  CL_ParseSnapshot( &dmsg );  if ( outSnapFlags ) *outSnapFlags = cl.snap.snapFlags; kind = 2; break;
+		default: return -1;
+		}
+	}
+	return kind;
+}
+
+// --split-map / --split-match : break one demo into several. Each output segment is a
+// self-contained demo: a fresh gamestate (from the live cl.gameState) followed by a
+// --copy of that segment's frames.
+//   split-map   : new segment at each mid-stream svc_gamestate (the server changed map).
+//   split-match : new segment at each fast_restart (SNAPFLAG_SERVERCOUNT flips in snapFlags).
+static int Cmd_Split( const char *inPath, int byMatch )
+{
+	snprintf( logFileName, sizeof( logFileName ), "%s.split.log", inPath );
+	FILE *lf = fopen( logFileName, "w" ); if ( lf ) fclose( lf );
+	g_quietLog = 1;
+
+	if ( !FS_FOpenFileRead( inPath, &demo.demofile, qtrue ) || !demo.demofile )
+	{
+		printf( "error: cannot open '%s'\n", inPath );
+		return 1;
+	}
+
+	// derive an output base: strip a trailing .dm_1
+	char base[ 1024 ];
+	Q_strncpyz( base, inPath, sizeof( base ) );
+	char *dot = strrchr( base, '.' );
+	char *sl  = strrchr( base, '/' ); char *bs = strrchr( base, '\\' ); if ( bs > sl ) sl = bs;
+	if ( dot && dot > sl ) *dot = 0;
+
+	static byte frame[ MAX_MSGLEN ];
+	int seq, len, segment = 0, outSeq = 0, segFrames = 0, prevServerCount = -1, frameNo = 0;
+	FILE *out = NULL;
+	char outName[ 1100 ];
+
+	while ( Demo_ReadRawFrame( demo.demofile, &seq, frame, &len ) )
+	{
+		clc.serverMessageSequence = seq;
+		// peek (decodes into cl); keep a copy because transcode re-reads the same bytes
+		static byte peekCopy[ MAX_MSGLEN ];
+		memcpy( peekCopy, frame, len );
+		int snapFlags = 0;
+		int kind = Demo_ClassifyFrame( peekCopy, len, &snapFlags );
+
+		int boundary = 0;
+		if ( frameNo > 0 )   // never split before the very first gamestate
+		{
+			if ( !byMatch && kind == 1 )                    // split-map: a 2nd+ gamestate
+				boundary = 1;
+			else if ( byMatch && kind == 2 )                // split-match: snapFlags server-count flip
+			{
+				int sc = snapFlags & SNAPFLAG_SERVERCOUNT;
+				if ( prevServerCount >= 0 && sc != prevServerCount )
+					boundary = 1;
+				prevServerCount = sc;
+			}
+		}
+		else if ( byMatch && kind == 2 )
+			prevServerCount = snapFlags & SNAPFLAG_SERVERCOUNT;
+
+		// open a new segment file at the very start or at a boundary
+		if ( !out || boundary )
+		{
+			if ( out )
+			{
+				int eof = -1; fwrite( &eof, 4, 1, out ); fwrite( &eof, 4, 1, out );
+				fclose( out );
+				if ( !g_quietLog ) ; // (segment summary printed below)
+				g_quietLog = 0; printf( "  segment %d: %d frames -> %s\n", segment, segFrames, outName ); g_quietLog = 1;
+			}
+			segment++;
+			snprintf( outName, sizeof( outName ), "%s_%s%d.dm_1", base, byMatch ? "match" : "map", segment );
+			out = fopen( outName, "wb" );
+			if ( !out ) { printf( "error: cannot write '%s'\n", outName ); fclose( demo.demofile ); return 1; }
+			outSeq = 0; segFrames = 0;
+
+			// segments after the first need their own leading gamestate (the original
+			// gamestate only loads at the very start of the file). For split-map the
+			// boundary frame IS a gamestate, so it self-serves; for split-match we must
+			// synthesize one from the current cl.gameState.
+			if ( boundary && byMatch )
+			{
+				static byte gbuf[ MAX_MSGLEN ];
+				msg_t gmsg; MSG_Init( &gmsg, gbuf, sizeof( gbuf ) );
+				SV_WriteGameState( &gmsg );                 // full gamestate from the live cl.gameState
+				Demo_WriteFrame( out, outSeq++, 0, gmsg.data, gmsg.cursize );
+				segFrames++;
+			}
+		}
+
+		// write this frame to the current segment as an exact copy
+		if ( Demo_TranscodeFrame( frame, len, out, outSeq, NULL ) == 1 ) { outSeq++; segFrames++; }
+		frameNo++;
+	}
+
+	if ( out )
+	{
+		int eof = -1; fwrite( &eof, 4, 1, out ); fwrite( &eof, 4, 1, out );
+		fclose( out );
+		g_quietLog = 0; printf( "  segment %d: %d frames -> %s\n", segment, segFrames, outName ); g_quietLog = 1;
+	}
+
+	fclose( demo.demofile );
+	demo.demofile = NULL;
+	g_quietLog = 0;
+	printf( "split into %d %s segment(s)\n", segment, byMatch ? "match" : "map" );
+	return 0;
+}
+
 // Parse a demo timestamp: "M:SS", plain seconds, or the keywords "start" (=0) /
 // "end" (=demo end). Returns milliseconds from the demo start.
 static int parseTimeMs( const char *s )
@@ -3601,7 +3739,9 @@ static void Usage( void )
 	printf( "  cod2-demotool --cut        <in.dm_1> <out.dm_1> <s> <e>  keep only the time range [s, e]\n" );
 	printf( "  cod2-demotool --clean      <in.dm_1> <out.dm_1> <what>   strip chat / centertext / whitetext / all\n" );
 	printf( "  cod2-demotool --remove-hud <in.dm_1> <out.dm_1> [keep <shader>]   strip server-set HUD elements\n" );
-	printf( "  cod2-demotool --scale-score <in.dm_1> <out.dm_1> <mult> scale the +N score popups (e.g. 0.2)\n\n" );
+	printf( "  cod2-demotool --scale-score <in.dm_1> <out.dm_1> <mult> scale the +N score popups (e.g. 0.2)\n" );
+	printf( "  cod2-demotool --split-map   <demo.dm_1>                split a multi-map demo into one file per map\n" );
+	printf( "  cod2-demotool --split-match <demo.dm_1>                split into one file per match (fast_restart)\n\n" );
 	printf( "  times are mm:ss from the demo start (or plain seconds), or the words 'start' / 'end'\n" );
 	printf( "  e.g.  cod2-demotool --cut game.dm_1 clip.dm_1 1:30 3:00\n\n" );
 	printf( "  batch: drop several demos at once -> a summary for each; with --overview, a <demo>.html each\n" );
@@ -3741,6 +3881,12 @@ int main( int argc, char **argv )
 		g_scoreMult  = (float)atof( path3 );
 		return Cmd_Copy( path, path2 );
 	}
+
+	if ( !strcmp( mode, "--split-map" ) )
+		return Cmd_Split( path, 0 );
+
+	if ( !strcmp( mode, "--split-match" ) )
+		return Cmd_Split( path, 1 );
 
 	if ( !strcmp( mode, "--cut" ) )
 	{
