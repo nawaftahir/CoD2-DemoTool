@@ -53,6 +53,11 @@ Human-friendly summaries of what changed in CoD2-DemoTool.
 - **`--convert`** — re-tag a demo's CoD2 version (`--convert game.dm_1 out.dm_1 118`).
   CoD2's demo format is identical across versions, so this just rewrites the version
   in the demo so it loads on a client of the target version.
+- **`--merge`** *(experimental)* — join two demos of the same map and mod into one
+  continuous demo with no map reload: `--merge a.dm_1 b.dm_1 ab.dm_1`. Demo B is
+  re-timed onto the end of A and its changed game state (scores, etc.) is carried over.
+  Caveat (same as the CoD4 tool): brand-new objects in B can flicker, and the camera
+  stays on demo A's player.
 
 ### Added (UX)
 - **Batch / drag-and-drop** — pass several demos at once: with no command you get a

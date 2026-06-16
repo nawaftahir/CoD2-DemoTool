@@ -2715,11 +2715,12 @@ static int Cmd_Dump( const char *path )
 // Edit modes for the transcoder's drop/re-time decision.
 #define EDIT_SKIPDEAD 0
 #define EDIT_CUT      1
+#define EDIT_MERGE    2
 
 // Edit running state, threaded through the transcoder (NULL = plain copy).
 typedef struct
 {
-	int mode;                  // EDIT_SKIPDEAD or EDIT_CUT
+	int mode;                  // EDIT_SKIPDEAD / EDIT_CUT / EDIT_MERGE
 	int timeOffset;            // ms removed before the current frame (the re-time amount)
 	int dropped;               // frames dropped
 	int forceFulls;            // cut/rebase frames emitted (delta base is the previous kept frame)
@@ -2732,6 +2733,8 @@ typedef struct
 	int cutStartMs;            // cut: keep [cutStartMs, cutEndMs] relative to firstTime
 	int cutEndMs;
 	int pastEnd;               // set once we pass cutEndMs so the caller can stop reading
+	// merge: fixed re-time so B's snapshots continue A's timeline (timeOffset = mergeShift)
+	int mergeShift;            // = firstB_serverTime - (lastA_serverTime + step); shifts B forward
 } skipState_t;
 
 // Read the next demo frame's raw bytes ([seq][len][len bytes]); 0 at EOF.
@@ -2849,6 +2852,10 @@ static int Demo_TranscodeFrame( const byte *frame, int frameLen, FILE *out, int 
 				if ( rel < skip->cutStartMs || rel > skip->cutEndMs ) dropFrame = 1;
 				if ( rel > skip->cutEndMs ) skip->pastEnd = 1;   // nothing left to keep
 				skip->timeOffset = skip->cutStartMs;             // drop the leading slice, re-time by it
+			}
+			else if ( skip->mode == EDIT_MERGE )
+			{
+				skip->timeOffset = skip->mergeShift;             // shift B forward onto A's timeline
 			}
 			else // EDIT_SKIPDEAD
 			{
@@ -3219,6 +3226,117 @@ static int Cmd_Cut( const char *inPath, const char *outPath, const char *startAr
 	}
 	if ( err ) printf( "  [%d errors]", err );
 	printf( "  ->  %s\n", outPath );
+	return 0;
+}
+
+// --merge inA inB out : append demo B after demo A as one continuous demo (no map
+// reload). EXPERIMENTAL (same as Caball's): works for same-map/mod demos; entities
+// whose baseline differs in B can ghost, and the POV stays A's local player.
+//
+// Strategy: keep A's gamestate; copy A verbatim (recording its last serverTime + the
+// running output sequence). Then decode B and re-emit its snapshots shifted forward
+// onto A's timeline (EDIT_MERGE), first one non-delta, injecting B's differing
+// configstrings as mid-stream svc_configstring updates so scores/start-time follow.
+static int Cmd_Merge( const char *inA, const char *inB, const char *outPath )
+{
+	snprintf( logFileName, sizeof( logFileName ), "%s.merge.log", inA );
+	FILE *lf = fopen( logFileName, "w" ); if ( lf ) fclose( lf );
+	g_quietLog = 1;
+
+	FILE *out = fopen( outPath, "wb" );
+	if ( !out ) { printf( "error: cannot write '%s'\n", outPath ); return 1; }
+
+	static byte frame[ MAX_MSGLEN ];
+	int seq, len, outSeq = 0, framestep = 50;
+
+	// --- pass 1: copy A verbatim, capture its tail timeline + configstrings ---
+	if ( !FS_FOpenFileRead( inA, &demo.demofile, qtrue ) || !demo.demofile )
+	{ printf( "error: cannot open '%s'\n", inA ); fclose( out ); return 1; }
+
+	int lastA = 0, aFrames = 0, prevA = -1, stepSeen = 0;
+	while ( Demo_ReadRawFrame( demo.demofile, &seq, frame, &len ) )
+	{
+		clc.serverMessageSequence = seq;
+		if ( Demo_TranscodeFrame( frame, len, out, outSeq, NULL ) == 1 ) outSeq++;
+		if ( cl.snap.serverTime > lastA ) lastA = cl.snap.serverTime;
+		if ( prevA >= 0 && cl.snap.serverTime > prevA && !stepSeen )
+		{ framestep = cl.snap.serverTime - prevA; if ( framestep > 0 && framestep <= 200 ) stepSeen = 1; }
+		prevA = cl.snap.serverTime;
+		aFrames++;
+	}
+	int maxCmdSeqA = clc.serverCommandSequence;
+	// snapshot A's serverinfo configstrings so we can diff B against them
+	static char csA[ MAX_CONFIGSTRINGS ][ MAX_STRING_CHARS ];
+	for ( int i = 0; i < MAX_CONFIGSTRINGS; i++ )
+		Q_strncpyz( csA[ i ], CL_ConfigString( i ), sizeof( csA[ 0 ] ) );
+	fclose( demo.demofile ); demo.demofile = NULL;
+
+	// --- read B's first snapshot time (need its gamestate first) ---
+	if ( !FS_FOpenFileRead( inB, &demo.demofile, qtrue ) || !demo.demofile )
+	{ printf( "error: cannot open '%s'\n", inB ); fclose( out ); return 1; }
+
+	skipState_t skip;
+	memset( &skip, 0, sizeof( skip ) );
+	skip.mode = EDIT_MERGE;
+	g_sfValid = qfalse; g_sfCur = 0;        // first B snapshot will be non-delta (prev=NULL)
+
+	int firstBTime = -1, bKept = 0, injected = 0, gotGamestate = 0;
+	while ( Demo_ReadRawFrame( demo.demofile, &seq, frame, &len ) )
+	{
+		clc.serverMessageSequence = seq;
+
+		// classify without emitting (decodes into cl) — B's gamestate is dropped, not re-sent
+		static byte peek[ MAX_MSGLEN ];
+		memcpy( peek, frame, len );
+		int sf = 0, kind = Demo_ClassifyFrame( peek, len, &sf );
+
+		if ( kind == 1 )            // B's gamestate: parsed into cl above; do NOT emit (would reload map)
+		{
+			gotGamestate = 1;
+			// inject configstrings that differ from A (scores, start-time, motd, winner...)
+			for ( int i = 0; i < MAX_CONFIGSTRINGS; i++ )
+			{
+				const char *bcs = CL_ConfigString( i );
+				if ( i == 0 ) continue;                       // serverinfo: keep A's (same map/version)
+				if ( !bcs[ 0 ] || !strcmp( bcs, csA[ i ] ) ) continue;
+				// A mid-stream configstring change rides the reliable-command channel as
+				// `cs <index> "<value>"` (a svc_serverCommand) — svc_configstring is only
+				// valid inside a gamestate block, so we must NOT emit it standalone.
+				static byte cbuf[ MAX_MSGLEN ]; msg_t cmsg; MSG_Init( &cmsg, cbuf, sizeof( cbuf ) );
+				char cscmd[ MAX_STRING_CHARS + 16 ];
+				snprintf( cscmd, sizeof( cscmd ), "cs %d \"%s\"", i, bcs );
+				MSG_WriteByte( &cmsg, svc_serverCommand );
+				MSG_WriteLong( &cmsg, ++maxCmdSeqA );        // continue A's command sequence
+				MSG_WriteBigStringRaw( &cmsg, cscmd );
+				MSG_WriteByte( &cmsg, svc_EOF );
+				Demo_WriteFrame( out, outSeq++, 0, cmsg.data, cmsg.cursize );
+				injected++;
+			}
+			continue;
+		}
+
+		if ( kind == 2 && firstBTime < 0 )
+		{
+			firstBTime = cl.snap.serverTime;
+			skip.mergeShift = firstBTime - ( lastA + framestep );   // shift B forward onto A's tail
+			// keep B's command sequence strictly above A's so its chat/score isn't deduped away
+			if ( clc.serverCommandSequence <= maxCmdSeqA )
+				clc.serverCommandSequence = maxCmdSeqA;
+		}
+
+		// re-emit B's frame (snapshots get EDIT_MERGE re-timing; first is non-delta)
+		if ( Demo_TranscodeFrame( frame, len, out, outSeq, &skip ) == 1 ) { outSeq++; bKept++; }
+	}
+
+	int eof = -1; fwrite( &eof, 4, 1, out ); fwrite( &eof, 4, 1, out );
+	fclose( out ); fclose( demo.demofile ); demo.demofile = NULL;
+	g_quietLog = 0;
+
+	printf( "merge: A=%d frames + B=%d frames (%d configstrings injected) -> %s\n",
+		aFrames, bKept, injected, outPath );
+	if ( !gotGamestate )
+		printf( "  warning: demo B had no gamestate frame — merge may be incomplete\n" );
+	printf( "  note: experimental — same-map/mod only; new B entities may ghost; POV stays demo A's player\n" );
 	return 0;
 }
 
@@ -3784,7 +3902,9 @@ static void Usage( void )
 	printf( "  cod2-demotool --remove-hud <in.dm_1> <out.dm_1> [keep <shader>]   strip server-set HUD elements\n" );
 	printf( "  cod2-demotool --scale-score <in.dm_1> <out.dm_1> <mult> scale the +N score popups (e.g. 0.2)\n" );
 	printf( "  cod2-demotool --split-map   <demo.dm_1>                split a multi-map demo into one file per map\n" );
-	printf( "  cod2-demotool --split-match <demo.dm_1>                split into one file per match (fast_restart)\n\n" );
+	printf( "  cod2-demotool --split-match <demo.dm_1>                split into one file per match (fast_restart)\n" );
+	printf( "  cod2-demotool --convert    <in.dm_1> <out.dm_1> <ver> re-tag version: 115|117|118|119|120\n" );
+	printf( "  cod2-demotool --merge      <A.dm_1> <B.dm_1> <out.dm_1>  join two same-map demos (experimental)\n\n" );
 	printf( "  times are mm:ss from the demo start (or plain seconds), or the words 'start' / 'end'\n" );
 	printf( "  e.g.  cod2-demotool --cut game.dm_1 clip.dm_1 1:30 3:00\n\n" );
 	printf( "  batch: drop several demos at once -> a summary for each; with --overview, a <demo>.html each\n" );
@@ -3923,6 +4043,16 @@ int main( int argc, char **argv )
 		g_scaleScore = 1;
 		g_scoreMult  = (float)atof( path3 );
 		return Cmd_Copy( path, path2 );
+	}
+
+	if ( !strcmp( mode, "--merge" ) )
+	{
+		if ( !path2 || !path3 )
+		{
+			printf( "usage: cod2-demotool --merge <A.dm_1> <B.dm_1> <out.dm_1>   (experimental, same map/mod)\n" );
+			return 1;
+		}
+		return Cmd_Merge( path, path2, path3 );
 	}
 
 	if ( !strcmp( mode, "--split-map" ) )
