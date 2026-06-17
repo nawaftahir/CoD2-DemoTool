@@ -1,7 +1,12 @@
-# CoD2-DemoTool — Win32 GUI front-end (parked plan)
+# CoD2-DemoTool — GUI front-end
 
-> **Status: PLANNED, not implemented.** Parked for later. The CLI is the only shipping interface today.
-> When picking this up, work on branch `gui-win32` off `nightly`; keep the CLI 100% intact.
+> **Status: IMPLEMENTED** on branch `gui-win32` as an **ImGui** app (CoD2-menu themed) —
+> `src/gui_imgui.cpp` + vendored `src/imgui/` + `build-win-gui.sh`. ImGui builds from WSL via dockcross on
+> the **Win32 + OpenGL3** backend (DirectX is the only ImGui backend that can't mingw-cross-compile; we
+> avoid it — no DX, no MSVC, no GLFW). The notes below were the original *plain-Win32-controls* plan, kept
+> for context: the in-process `Cmd_*` dispatch, freopen stdout capture, per-op state hygiene, and the
+> 6-operation design all carried over unchanged — only the rendering face is ImGui now. The CLI stays
+> 100% intact.
 
 ## Context / why
 

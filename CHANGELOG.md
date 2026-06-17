@@ -6,12 +6,14 @@ Human-friendly summaries of what changed in CoD2-DemoTool.
 
 ### Added
 - **Windows GUI (`cod2-demotool-gui.exe`)** — a proper window so you don't need the
-  command line. Double-click to open it, **drag a demo in** (or click Browse), pick what
-  to do from a dropdown — Info, Skip dead-time, Cut, Remove HUD, Clean text, or Match
-  overview — set the output name (filled in for you), and click **Run**. The result shows
-  in the window; the overview opens the HTML in your browser. No console window, no flags.
-  The command-line `cod2-demotool.exe` is unchanged for scripts and power users. Build it
-  with `make win-gui` (or `./build-win-gui.sh`).
+  command line, with a dark **CoD2-menu look** (amber/gold accent). Double-click to open
+  it, **drag a demo in** (or click Browse), pick what to do from a dropdown — Info, Skip
+  dead-time, Cut, Remove HUD, Clean text, or Match overview — set the output name (filled
+  in for you), and click **Run**. The result shows in the window; the overview opens the
+  HTML in your browser. No console window, no flags. The command-line `cod2-demotool.exe`
+  is unchanged for scripts and power users. Build it with `make win-gui` (or
+  `./build-win-gui.sh`). Built with ImGui on a Win32 + OpenGL backend, so it
+  cross-compiles from Linux/WSL with the same toolchain as the CLI.
 - **`--info`** — read any CoD2 demo and print a one-glance summary: game version,
   map, gametype, length, frame count, players, and the server's hostname. The game
   version is detected automatically from inside the demo.
