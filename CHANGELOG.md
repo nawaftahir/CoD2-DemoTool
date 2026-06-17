@@ -15,10 +15,12 @@ Human-friendly summaries of what changed in CoD2-DemoTool.
 - **`--copy`** — re-encode a demo unchanged, frame by frame, into a new playable
   demo. The round-trip that proves the writer: every frame transcodes, the output
   re-parses identically, and it lands within ~1% of the original size.
-- **`--skip-dead`** — the headline feature: removes every death-to-respawn stretch
-  (including the killcam) and re-times the demo so the action plays back-to-back in
-  an unmodified CoD2 client. A 1:40 match plays in ~1:19; on a 30-minute demo it
-  trims ~100 seconds of dead time. Confirmed in-game.
+- **`--skip-dead`** — the headline feature: removes every death-to-respawn stretch —
+  the dead-stare, the **killcam** (the seconds spent watching your killer), and any
+  spectating — and re-times the demo so the action plays back-to-back in an unmodified
+  CoD2 client. A 15:20 CTF match plays in ~12:24 (~3 minutes of dead-time and killcams
+  removed). Add **`keep-killcam`** (`--skip-dead in out keep-killcam`) to keep the kill
+  replays and trim only the dead-stare/spectating instead (15:20 → 14:31).
 - **`--deadscan`** — diagnostic that lists where the player is dead, so you can see
   exactly what `--skip-dead` will cut before running it.
 - **`--commands`** — list every server command in the demo by time (chat, announcements,
@@ -42,9 +44,11 @@ Human-friendly summaries of what changed in CoD2-DemoTool.
   notices), or `all`. e.g. `--clean game.dm_1 clean.dm_1 chat whitetext`. Scores,
   scoreboard, cvars and all gameplay are kept — only the chosen text goes.
 - **`--remove-hud`** — strip the server-set HUD elements (custom overlays, kill cards,
-  server logos) from a demo. Add `keep <shader-name>` to keep matching ones. (The
-  hitmarker and the ammo/score readouts aren't stored in CoD2 demos, so they're
-  unaffected; team-skull head icons live in the entity data and are left alone.)
+  server logos, +N score popups) from a demo. Add `keep <shader-name>` to keep matching
+  ones. The ammo/grenade readout (bottom-right) and the compass are **not** HUD elements
+  and aren't stored in the demo — the client draws them from the player's own weapon/ammo
+  state — so they can't be removed here (hide the compass in-game with `cg_drawcompass 0`).
+  The command now prints this so it's clear what was and wasn't touched.
 - **`--scale-score`** — multiply the value of the "+N" score-popup HUD elements, e.g.
   `--scale-score game.dm_1 out.dm_1 0.2` to turn +50 into +10.
 - **`--split-map`** / **`--split-match`** — break one recording that spans several maps
@@ -79,6 +83,17 @@ Human-friendly summaries of what changed in CoD2-DemoTool.
   now edit cleanly. (Also hardened the reader so a malformed demo can never crash it.)
 - HUD element animation timings (fades, scales, moves) are now re-timed across a cut,
   so on-screen HUD elements stay in sync after dead-time is removed.
+- **`--skip-dead` was leaving the killcam in.** After a death the demo follows your
+  killer for a few seconds (the killcam), and during that time the recording shows the
+  *killer's* state — alive, full health — so the old detector thought you'd already
+  respawned and kept the whole killcam. It now recognises the follow-the-killer state
+  and cuts the full dead → killcam → respawn stretch (or keeps just the killcam with
+  `keep-killcam`). On a 15:20 match this removed ~2 extra minutes that used to slip
+  through. Free-spectating other players is cut too.
+- The respawn countdown ("Spawn in N seconds") could show a wrong number after an edit:
+  the timer it's drawn from lives in a second HUD array that wasn't being re-timed.
+  Both HUD arrays are now shifted, so timers (respawn, round clock, bomb timer) read
+  correctly across a cut.
 
 ### Notes
 - A single binary reads demos from **every CoD2 version** — 1.0, 1.2, 1.3, and

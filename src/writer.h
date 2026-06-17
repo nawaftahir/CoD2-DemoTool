@@ -559,13 +559,24 @@ static void RetimePlayerstate( playerState_t *ps, int off )
 	if ( ps->shellshockTime )     ps->shellshockTime     -= off;
 	if ( ps->adsDelayTime )       ps->adsDelayTime       -= off;
 
-	// HUD element animation timings are absolute serverTimes — the engine re-times
-	// these in its archived-snapshot path (the "archive" retime). Only the archival
-	// set, exactly as the engine. (No future-clamp: we subtract, so a fade that was
-	// scheduled ahead stays correctly ahead on the shifted timeline.)
+	// HUD element animation timings are absolute serverTimes that must be shifted too.
+	// BOTH arrays: the engine re-times `archival[]` in its archived-snapshot path (the
+	// killcam replay buffer), but the live client renders timers — the "Spawn in N"
+	// respawn countdown, the round clock, the SD bomb timer — from `current[]`. Miss
+	// current[] and any timer ticking across a cut shows a wrong (stale-absolute)
+	// value. The four fields are the same in both arrays (hudelem_t). (No future-clamp:
+	// we subtract, so a timer scheduled ahead stays correctly ahead on the new clock.)
 	for ( int i = 0; i < MAX_HUDELEMS_ARCHIVAL; i++ )
 	{
 		hudelem_t *h = &ps->hud.archival[ i ];
+		if ( h->time )           h->time           -= off;
+		if ( h->fadeStartTime )  h->fadeStartTime  -= off;
+		if ( h->scaleStartTime ) h->scaleStartTime -= off;
+		if ( h->moveStartTime )  h->moveStartTime  -= off;
+	}
+	for ( int i = 0; i < MAX_HUDELEMS_CURRENT; i++ )
+	{
+		hudelem_t *h = &ps->hud.current[ i ];
 		if ( h->time )           h->time           -= off;
 		if ( h->fadeStartTime )  h->fadeStartTime  -= off;
 		if ( h->scaleStartTime ) h->scaleStartTime -= off;

@@ -5,9 +5,11 @@ and writes a new demo that plays in an unmodified CoD2 client — or renders the
 match as a readable timeline.
 
 The headline feature is **skip dead-time**: a normal match demo spends much of
-its length showing you a respawn timer. This tool removes those dead stretches
-by re-timing the demo, so playback is action-only — something the server
-physically can't do, because demo playback is driven by timestamps.
+its length showing you a respawn timer and the killcam of whoever just killed you.
+This tool removes those dead stretches — the dead-stare, the killcam, and any
+spectating — by re-timing the demo, so playback is action-only. (Something the
+server physically can't do, because demo playback is driven by timestamps.) Prefer
+to keep the kill replays? Add `keep-killcam` to cut only the dead-stare/spectating.
 
 Works with demos from **every CoD2 version** — 1.0, 1.2, 1.3, and 1.4/CoD2x
 (protocols 115/117/118/119) — from one binary. The version is detected
@@ -17,7 +19,8 @@ automatically from the demo itself.
 
 ```
 cod2-demotool --info      <demo.dm_1>                show what a demo is (version, map, length, players)
-cod2-demotool --skip-dead <in.dm_1> <out.dm_1>       remove death/respawn dead-time
+cod2-demotool --skip-dead <in.dm_1> <out.dm_1>       remove dead-time + killcam + spectating
+cod2-demotool --skip-dead <in.dm_1> <out.dm_1> keep-killcam   keep the kill replays, cut only the dead-stare
 cod2-demotool --cut       <in.dm_1> <out.dm_1> <s> <e>   keep only the time range [s, e]
 cod2-demotool --overview  <demo.dm_1> [out.html]     match timeline: kills, chat, score (HTML optional)
 

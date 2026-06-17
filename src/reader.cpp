@@ -2708,9 +2708,69 @@ static int Cmd_Dump( const char *path )
 	return 0;
 }
 
-// pm_type values (engine: PM_NORMAL=0 .. PM_DEAD=6, PM_DEAD_LINKED=7).
-#define PM_NORMAL_LINKED 1
-#define PM_DEAD          6
+// pm_type values (engine: PM_NORMAL=0 .. PM_INTERMISSION=5, PM_DEAD=6, PM_DEAD_LINKED=7).
+#define PM_NORMAL          0
+#define PM_NORMAL_LINKED   1
+#define PM_SPECTATOR       4     // free-float spectate (own slot, not following)
+#define PM_INTERMISSION    5
+#define PM_DEAD            6
+#define PM_DEAD_LINKED     7
+
+// pm_flags bits we care about. CoD2 1.3 (bg_public.h): the engine forces the
+// spectating player's playerstate to a COPY of the player being watched. During a
+// killcam the player follows their killer, so PMF_FOLLOW is set and ps.clientNum
+// becomes the killer's slot. (Verified empirically on a real CTF demo: post-death
+// frames carry flags 0x00400142, cnum != owner for the whole killcam.)
+#define PMF_FOLLOW         0x400000     // following another player (killcam / follow-spectate)
+#define PMF_SPECTATOR_FREE 0x1000000    // free-float spectate (this decoder's old "PMF_SPECTATING")
+
+// How the local (recording) player is faring on a given snapshot. The whole point
+// of skip-dead is to keep only ST_ALIVE (the recorder in their own body, alive) and
+// cut everything else.
+typedef enum
+{
+	ST_ALIVE,            // own body, pm 0/1, health > 0 — real action
+	ST_DEAD_OR_KILLCAM,  // own body dead (pm 6/7) OR following the killer (killcam)
+	ST_FREE_SPECTATE     // free-float spectate (pm 4, own slot)
+} frameState_t;
+
+static const char *FrameStateName( frameState_t st )
+{
+	if ( st == ST_ALIVE )           return "(alive)";
+	if ( st == ST_FREE_SPECTATE )   return "(spectate)";
+	return "(dead/killcam)";
+}
+
+// Classify one snapshot's playerstate. ownNum is the recording client's own slot
+// (clc.clientNum). Order matters: the follow/foreign-slot test runs FIRST so a
+// killcam — which presents as pm 0, health 100 of the *killer* — is never mistaken
+// for the recorder being alive.
+static frameState_t ClassifyFrame( const playerState_t *ps, int ownNum )
+{
+	int pm       = ps->pm_type;
+	int hp       = ps->stats[ STAT_HEALTH ];
+	int following = ( ps->pm_flags & PMF_FOLLOW ) != 0;
+	int foreignPS = ( ps->clientNum != ownNum );
+
+	// Killcam / following another player: the camera is on someone else.
+	if ( following || foreignPS )
+		return ST_DEAD_OR_KILLCAM;
+
+	// Own body, dead and waiting (pm 6/7).
+	if ( pm >= PM_DEAD )
+		return ST_DEAD_OR_KILLCAM;
+
+	// Free-float spectate (own slot, pm 4).
+	if ( pm == PM_SPECTATOR )
+		return ST_FREE_SPECTATE;
+
+	// Own body, alive.
+	if ( pm <= PM_NORMAL_LINKED && hp > 0 )
+		return ST_ALIVE;
+
+	// pm 0/1 but health 0 — a death/respawn transition frame; not real action.
+	return ST_DEAD_OR_KILLCAM;
+}
 
 // Edit modes for the transcoder's drop/re-time decision.
 #define EDIT_SKIPDEAD 0
@@ -2726,7 +2786,9 @@ typedef struct
 	int forceFulls;            // cut/rebase frames emitted (delta base is the previous kept frame)
 	// skip-dead
 	int inDeadSpan;            // currently inside a death->respawn span
-	int deathTime;             // serverTime the current dead span began
+	int deathTime;             // serverTime the current dead span began (start of a dropped run)
+	int keepKillcam;           // 1 = keep killcam frames (follow-the-killer), cut only own-body dead
+	int killcamKept;           // diagnostic: killcam frames kept (when keepKillcam)
 	// cut
 	int firstTime;             // serverTime of the first snapshot (captured once)
 	int haveFirst;
@@ -2859,19 +2921,41 @@ static int Demo_TranscodeFrame( const byte *frame, int frameLen, FILE *out, int 
 			}
 			else // EDIT_SKIPDEAD
 			{
-				int pm = cl.snap.ps.pm_type;
-				int hp = cl.snap.ps.stats[ STAT_HEALTH ];
-				int dead    = ( pm >= PM_DEAD );
-				int playing = ( pm <= PM_NORMAL_LINKED ) && hp > 0;
+				frameState_t fs = ClassifyFrame( &cl.snap.ps, clc.clientNum );
 
-				if ( !skip->inDeadSpan )
+				// Keep only the recorder alive in their own body. --keep-killcam also
+				// keeps killcam frames (following the killer); own-body dead and
+				// free-spectate are always dropped.
+				int keep;
+				if ( fs == ST_ALIVE )
+					keep = 1;
+				else if ( skip->keepKillcam && fs == ST_DEAD_OR_KILLCAM
+				          && ( cl.snap.ps.pm_flags & PMF_FOLLOW ) )
 				{
-					if ( dead ) { skip->inDeadSpan = 1; skip->deathTime = t; dropFrame = 1; }
+					keep = 1;
+					skip->killcamKept++;
+				}
+				else
+					keep = 0;
+
+				// Re-time by the total dropped duration so far. Accumulating the gap
+				// since the previous snapshot is correct whether the whole dead span
+				// is dropped (default) or only part of it (keep-killcam).
+				if ( !keep )
+				{
+					if ( skip->inDeadSpan ) skip->timeOffset += t - skip->deathTime;
+					skip->deathTime = t;       // advance the running drop anchor
+					skip->inDeadSpan = 1;
+					dropFrame = 1;
 				}
 				else
 				{
-					if ( playing ) { skip->inDeadSpan = 0; skip->timeOffset += t - skip->deathTime; isCut = qtrue; }
-					else dropFrame = 1;
+					if ( skip->inDeadSpan )    // first kept frame after a dropped run
+					{
+						skip->timeOffset += t - skip->deathTime;
+						skip->inDeadSpan = 0;
+						isCut = qtrue;
+					}
 				}
 			}
 
@@ -2954,7 +3038,9 @@ static int Cmd_Copy( const char *inPath, const char *outPath )
 }
 
 // --skip-dead : drop every death->respawn span and re-time, into a new playable demo.
-static int Cmd_SkipDead( const char *inPath, const char *outPath )
+// keepKillcam: keep the killcam (the few seconds following the killer after a death)
+// and cut only the own-body dead-stare and any free-spectate.
+static int Cmd_SkipDead( const char *inPath, const char *outPath, int keepKillcam )
 {
 	snprintf( logFileName, sizeof( logFileName ), "%s.skip.log", inPath );
 	FILE *lf = fopen( logFileName, "w" ); if ( lf ) fclose( lf );
@@ -2975,6 +3061,7 @@ static int Cmd_SkipDead( const char *inPath, const char *outPath )
 
 	skipState_t skip;
 	memset( &skip, 0, sizeof( skip ) );
+	skip.keepKillcam = keepKillcam;
 	g_sfValid = qfalse;
 	g_sfCur   = 0;
 
@@ -3003,6 +3090,12 @@ static int Cmd_SkipDead( const char *inPath, const char *outPath )
 		kept, skip.dropped, sec, skip.timeOffset % 1000, skip.forceFulls );
 	if ( err ) printf( "  [%d errors]", err );
 	printf( "  ->  %s\n", outPath );
+	if ( keepKillcam )
+		printf( "  kept %d killcam frames (--keep-killcam): you still see each kill replay,\n"
+		        "  only the dead-stare and spectating were removed\n", skip.killcamKept );
+	else
+		printf( "  killcam and spectating were cut too (default). Use --keep-killcam to keep the\n"
+		        "  kill replays.\n" );
 	// If the demo ended while the player was still dead (never respawned), every
 	// remaining frame was dropped — warn so a truncated tail isn't a surprise.
 	if ( skip.inDeadSpan )
@@ -3354,8 +3447,10 @@ static int Cmd_DeadScan( const char *path )
 		return 1;
 	}
 
-	int firstTime = -1, prevPm = -999;
+	int firstTime = -1, prevTime = 0x7fffffff;
+	frameState_t prevState = (frameState_t)-1;
 	int deadStartMs = -1, spans = 0, deadMs = 0, total = 0;
+	int ownAlive = 0, killcamMs = 0;   // diagnostics: killcam time + own-alive frame count
 
 	while ( CL_ReadDemoMessage() )
 	{
@@ -3365,26 +3460,32 @@ static int Cmd_DeadScan( const char *path )
 		total++;
 
 		int t  = cl.snap.serverTime;
-		int pm = cl.snap.ps.pm_type;
-		int hp = cl.snap.ps.stats[ STAT_HEALTH ];
 		if ( firstTime < 0 ) firstTime = t;
 		int rel = t - firstTime;
-		int dead = ( pm >= PM_DEAD );
 
-		if ( pm != prevPm )
+		frameState_t st = ClassifyFrame( &cl.snap.ps, clc.clientNum );
+		if ( st == ST_ALIVE ) ownAlive++;
+		if ( st != prevState )
 		{
 			g_quietLog = 0;
-			printf( "  t=%5d.%03ds  pm_type=%d %-7s health=%d\n",
-				rel / 1000, rel % 1000, pm, dead ? "(DEAD)" : "(alive)", hp );
+			printf( "  t=%5d.%03ds  %-14s  pm_type=%d health=%d cnum=%d\n",
+				rel / 1000, rel % 1000, FrameStateName( st ),
+				cl.snap.ps.pm_type, cl.snap.ps.stats[ STAT_HEALTH ], cl.snap.ps.clientNum );
 			g_quietLog = 1;
-			prevPm = pm;
+			prevState = st;
 		}
 
-		// A dead span runs from death (pm_type >= PM_DEAD) until the player is
-		// playing again (pm_type 0/1, alive), so it includes the killcam (pm 4).
-		int playing = ( pm <= PM_NORMAL_LINKED ) && hp > 0;
-		if ( deadStartMs < 0 && pm >= PM_DEAD ) deadStartMs = t;
-		if ( deadStartMs >= 0 && playing ) { deadMs += t - deadStartMs; spans++; deadStartMs = -1; }
+		// A dead span runs from the moment the player stops being ALIVE (own body,
+		// alive) until they are ALIVE again — so it spans the whole arc:
+		// own-body dead (pm 6/7) -> killcam (following the killer) -> free-spectate
+		// (pm 4) -> respawn. ST_ALIVE is the only state that closes a span.
+		if ( deadStartMs < 0 && st != ST_ALIVE ) deadStartMs = t;
+		if ( deadStartMs >= 0 && st == ST_ALIVE ) { deadMs += t - deadStartMs; spans++; deadStartMs = -1; }
+		// Killcam portion = time spent following the killer; measured by the real gap
+		// to the previous frame, not a fixed step (frame cadence varies by sv_fps).
+		if ( prevTime != 0x7fffffff && ( cl.snap.ps.pm_flags & PMF_FOLLOW ) )
+			killcamMs += t - prevTime;
+		prevTime = t;
 	}
 	if ( deadStartMs >= 0 ) { deadMs += cl.snap.serverTime - deadStartMs; spans++; }
 
@@ -3396,6 +3497,15 @@ static int Cmd_DeadScan( const char *path )
 	printf( "\n  %d frames, %d:%02d total\n", total, totalMs / 60000, ( totalMs / 1000 ) % 60 );
 	printf( "  dead spans: %d   dead time: %d.%03ds  (%d%% of demo)\n",
 		spans, deadMs / 1000, deadMs % 1000, totalMs ? ( deadMs * 100 / totalMs ) : 0 );
+	printf( "  of which killcam (following the killer): ~%d.%03ds\n",
+		killcamMs / 1000, killcamMs % 1000 );
+
+	// Caster/spectator-demo guard: if the recorder is almost never alive in their
+	// own body, this is a spectator demo, not a player demo — skip-dead would gut it.
+	if ( total > 0 && ownAlive * 100 / total < 10 )
+		printf( "  WARNING: own-body-alive only %d%% of frames — looks like a spectator/caster\n"
+		        "           demo; --skip-dead would remove almost everything. Use --cut instead.\n",
+		        ownAlive * 100 / total );
 	return 0;
 }
 
@@ -3896,7 +4006,7 @@ static void Usage( void )
 	printf( "  cod2-demotool --commands <demo.dm_1>         list the server commands (chat, events) by time\n" );
 	printf( "  cod2-demotool --overview <demo.dm_1> [out.html]   match timeline: kills, chat, score (HTML optional)\n" );
 	printf( "  cod2-demotool --copy       <in.dm_1> <out.dm_1>          re-encode unchanged (round-trip proof)\n" );
-	printf( "  cod2-demotool --skip-dead  <in.dm_1> <out.dm_1>          remove death/respawn dead-time\n" );
+	printf( "  cod2-demotool --skip-dead  <in.dm_1> <out.dm_1> [keep-killcam]  remove dead-time (+killcam)\n" );
 	printf( "  cod2-demotool --cut        <in.dm_1> <out.dm_1> <s> <e>  keep only the time range [s, e]\n" );
 	printf( "  cod2-demotool --clean      <in.dm_1> <out.dm_1> <what>   strip chat / centertext / whitetext / all\n" );
 	printf( "  cod2-demotool --remove-hud <in.dm_1> <out.dm_1> [keep <shader>]   strip server-set HUD elements\n" );
@@ -3989,10 +4099,11 @@ int main( int argc, char **argv )
 	{
 		if ( !path2 )
 		{
-			printf( "usage: cod2-demotool --skip-dead <in.dm_1> <out.dm_1>\n" );
+			printf( "usage: cod2-demotool --skip-dead <in.dm_1> <out.dm_1> [keep-killcam]\n" );
 			return 1;
 		}
-		return Cmd_SkipDead( path, path2 );
+		int keepKillcam = ( path3 && !strcmp( path3, "keep-killcam" ) );
+		return Cmd_SkipDead( path, path2, keepKillcam );
 	}
 
 	// --clean <in> <out> <what...> : strip server-command text (chat / centertext / whitetext).
@@ -4029,7 +4140,12 @@ int main( int argc, char **argv )
 		g_removeHud = 1;
 		for ( int i = 2; i + 1 < np; i++ )
 			if ( !strcmp( p[ i ], "keep" ) ) g_keepShader = p[ i + 1 ];
-		return Cmd_Copy( path, path2 );
+		int rc = Cmd_Copy( path, path2 );
+		printf( "  removed all scripted HUD elements (kill cards, server logos, score popups).\n"
+		        "  the ammo/grenade readout (bottom-right) and the compass are NOT HUD elements —\n"
+		        "  the client draws them from the player's own weapon/ammo state, so they aren't in\n"
+		        "  the demo to remove. Hide the compass in-game with  cg_drawcompass 0.\n" );
+		return rc;
 	}
 
 	// --scale-score <in> <out> <mult> : scale the +N score-popup hud elements.
