@@ -166,6 +166,28 @@ static ovEvent_t g_ovEvents[ OV_MAX_EVENTS ];
 static int g_ovNumEvents = 0;
 int g_collectEvents = 0;
 
+#ifdef GUI_BUILD
+// The GUI calls the Cmd_* functions repeatedly in one process. The CLI relies on the
+// OS clearing these per-process; the GUI must zero them before every operation or a
+// previous run's filters leak into the next. Decoder state (cl/clc/demo) is already
+// reset per file by CL_ResetState inside FS_FOpenFileRead — only these stay sticky.
+// This is the single owner of the full filter-flag set; keep it next to the flags.
+static void ResetFilters( void )
+{
+	g_quietLog         = 0;
+	g_dumpCommands     = 0;
+	g_removeChat       = 0;
+	g_removeCenterText = 0;
+	g_removeWhiteText  = 0;
+	g_removeHud        = 0;
+	g_scaleScore       = 0;
+	g_scoreMult        = 1.0f;
+	g_keepShader       = NULL;
+	g_convertProtocol  = 0;
+	g_collectEvents    = 0;
+}
+#endif // GUI_BUILD
+
 void Com_Printf( const char *fmt, ...)
 {
 	va_list		argptr;
@@ -2671,8 +2693,17 @@ static int Cmd_Info( const char *path )
 	bool seen[ MAX_CLIENTS ];
 	memset( seen, 0, sizeof( seen ) );
 
+	// --info is just a summary — suppress the verbose per-frame log (otherwise a single
+	// --info writes a ~28 MB <demo>.log and takes ~14 s instead of a fraction of a second;
+	// this is what made a double-clicked .exe "do nothing" for ages). --dump is the
+	// command for the full log.
+	g_quietLog = 1;
 	if ( DecodeDemo( path, false, &frames, &firstTime, &lastTime, seen ) != 0 )
+	{
+		g_quietLog = 0;
 		return 1;
+	}
+	g_quietLog = 0;
 
 	const char *si    = CL_ConfigString( 0 );          // serverinfo
 	const char *sver  = Info_ValueForKey( si, "shortversion" );
@@ -4144,6 +4175,10 @@ static void HtmlPathFor( const char *demo, char *out, int outsize )
 	snprintf( out + len, outsize - len, ".html" );
 }
 
+// The CLI entry point. The GUI build (gui_win32.cpp #defines GUI_BUILD and #includes
+// this file) provides its own WinMain and calls the Cmd_* functions in-process, so the
+// console main is compiled out there to avoid a duplicate entry point.
+#ifndef GUI_BUILD
 int main( int argc, char **argv )
 {
 	const char *mode = NULL;
@@ -4165,8 +4200,10 @@ int main( int argc, char **argv )
 	}
 
 	// `--overview demo.dm_1 out.html` is the explicit single-demo HTML form — let it
-	// fall through to Cmd_Overview below, don't treat out.html as a second demo.
+	// fall through to Cmd_Overview below, don't treat out.html as a second demo. Only
+	// inspect p[1] when there actually is one (np == 2); p[1] is NULL otherwise.
 	int explicitHtml = ( mode && !strcmp( mode, "--overview" ) && np == 2 );
+	if ( explicitHtml )
 	{
 		int n = (int)strlen( p[ 1 ] );
 		if ( n < 5 || strcmp( p[ 1 ] + n - 5, ".html" ) != 0 ) explicitHtml = 0;
@@ -4340,3 +4377,4 @@ int main( int argc, char **argv )
 
 	return Cmd_Info( path );
 }
+#endif // GUI_BUILD
