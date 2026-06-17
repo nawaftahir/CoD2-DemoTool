@@ -36,12 +36,18 @@ Human-friendly summaries of what changed in CoD2-DemoTool.
   as a single self-contained dark-themed HTML page: header with map/score, the player
   summary table, and the full timeline with **names rendered in their CoD colours**
   and headshots highlighted. Share or archive a match as one file.
-- **Game-style killfeed icons** — the HTML killfeed now shows each kill as
-  *killer → [weapon icon] → victim*, like the in-game feed, with dedicated icons for
-  headshot / melee / falling / suicide kills. Icons are baked into the page (no external
-  files), and only the ones a match actually uses are embedded, so the page stays small.
-  Weapons without an icon yet (pistols, launchers, grenades) fall back to their name in
-  brackets. Icons are generated from `assets/icons/` by `scripts/gen_icons_header.py`.
+- **Game-style killfeed icons** — the HTML killfeed shows each kill as
+  *killer (weapon icon) victim*, laid out exactly like the in-game feed: the killer is
+  right-aligned, the icon centred, the victim left-aligned, so every icon and name lines
+  up in clean columns down the feed (no arrows). Dedicated icons for headshot / melee /
+  falling / suicide kills. Icons are baked into the page (no external files), and only the
+  ones a match actually uses are embedded, so the page stays small. Weapons without an
+  icon yet (pistols, launchers, grenades) fall back to their name in brackets. Icons are
+  generated from `assets/icons/` by `scripts/gen_icons_header.py`.
+- **Console-print types in the overview** — announcement lines now show whether they were
+  an `iprintln` (the bottom-left feed) or an `iprintlnbold` (the bold centred print),
+  tagged `(println)` / `(printlnbold)`, so you can tell normal notices from the important
+  centred ones at a glance.
 - **`--cut`** — trim a demo to a time range and play it from the start, e.g.
   `--cut game.dm_1 clip.dm_1 1:30 3:00`. Times are mm:ss from the demo start (or plain
   seconds), or the words `start` / `end`.

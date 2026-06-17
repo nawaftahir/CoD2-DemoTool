@@ -161,7 +161,7 @@ static void EditPlayerstateHud( playerState_t *ps )
 #define OV_ANNOUNCE   2
 #define OV_SCORE_ALLIES 3
 #define OV_SCORE_AXIS   4
-typedef struct { int kind; int value; char text[ 256 ]; } ovEvent_t;
+typedef struct { int kind; int value; char verb; char text[ 256 ]; } ovEvent_t;
 static ovEvent_t g_ovEvents[ OV_MAX_EVENTS ];
 static int g_ovNumEvents = 0;
 int g_collectEvents = 0;
@@ -2328,6 +2328,7 @@ void CL_ParseCommandString( msg_t *msg ) {
 		{
 			if ( isChat ) g_ovEvents[ g_ovNumEvents ].kind = ( s[ 0 ] == 'i' ) ? OV_TEAMCHAT : OV_CHAT;
 			else          g_ovEvents[ g_ovNumEvents ].kind = OV_ANNOUNCE;
+			g_ovEvents[ g_ovNumEvents ].verb = s[ 0 ];   // e/f/g for announces; h/i for chat
 			Q_strncpyz( g_ovEvents[ g_ovNumEvents ].text, clean, sizeof( g_ovEvents[ 0 ].text ) );
 			g_ovNumEvents++;
 		}
@@ -3900,8 +3901,12 @@ static int Cmd_Overview( const char *path, const char *htmlPath )
 					snprintf( mid, sizeof( mid ), "<span class=\"w%s\">%s</span>",
 						headshot ? " hs" : "", how );
 
+				// killer (icon) victim, like the in-game killfeed (no arrow — the icon
+				// is the separator). The killer cell is right-aligned so every icon and
+				// victim line up in two columns down the feed.
 				snprintf( row, sizeof( row ),
-					"<tr class=\"k\"><td>%d:%02d</td><td>%s <span class=\"arr\">&raquo;</span> %s %s</td></tr>\n",
+					"<tr class=\"k\"><td>%d:%02d</td><td class=\"kf\">"
+					"<span class=\"kr\">%s</span>%s<span class=\"vc\">%s</span></td></tr>\n",
 					rel / 60000, ( rel / 1000 ) % 60, h1, mid, h2 );
 				HtmlAppend( row );
 			}
@@ -3953,16 +3958,21 @@ static int Cmd_Overview( const char *path, const char *htmlPath )
 
 			if ( ev->kind == OV_ANNOUNCE )
 			{
+				// Tag the print type: f = iprintln (the bottom-left feed), g = iprintlnbold
+				// (the bold centred print). e = allClientsPrint has no distinct tag.
+				const char *tag = "";
+				if ( ev->verb == 'f' )      tag = "(println) ";
+				else if ( ev->verb == 'g' ) tag = "(printlnbold) ";
 				if ( html )
 				{
 					HtmlEscape( h1, clean, sizeof( h1 ) );
 					snprintf( row, sizeof( row ),
-						"<tr class=\"a\"><td>%d:%02d</td><td>%s</td></tr>\n",
-						rel / 60000, ( rel / 1000 ) % 60, h1 );
+						"<tr class=\"a\"><td>%d:%02d</td><td><span class=\"pt\">%s</span>%s</td></tr>\n",
+						rel / 60000, ( rel / 1000 ) % 60, tag, h1 );
 					HtmlAppend( row );
 				}
 				else
-					printf( "  %d:%02d  * %s\n", rel / 60000, ( rel / 1000 ) % 60, clean );
+					printf( "  %d:%02d  * %s%s\n", rel / 60000, ( rel / 1000 ) % 60, tag, clean );
 				notes++;
 			}
 			else
@@ -4030,11 +4040,15 @@ static int Cmd_Overview( const char *path, const char *htmlPath )
 			"td{padding:4px 10px;border-bottom:1px solid #20232b;font-family:Consolas,monospace;font-size:13px}\n"
 			"td:first-child{color:#6b7184;width:52px;white-space:nowrap}\n"
 			"tr.c td{color:#9fd49f} tr.a td{color:#d4c98f} tr.s td{color:#7fd4d4;font-weight:600}\n"
-			".arr{color:#6b7184} .w{color:#8a90a0;font-size:12px} .w:before{content:'['} .w:after{content:']'}\n"
+			".w{color:#8a90a0;font-size:12px} .w:before{content:'['} .w:after{content:']'}\n"
 			".hs{color:#ff6b6b} .tc{color:#6b7184}\n"
+			".pt{color:#6b7184;font-size:11px}\n"   // iprintln/iprintlnbold type tag
 			// game-style killfeed icon: a fixed box, the PNG fitted inside it
 			".ic{display:inline-block;width:44px;height:22px;vertical-align:middle;margin:0 4px;"
-			"background-size:contain;background-repeat:no-repeat;background-position:center}\n",
+			"background-size:contain;background-repeat:no-repeat;background-position:center}\n"
+			// killfeed row: killer (right-aligned) | icon | victim, so columns line up
+			".kf{display:flex;align-items:center;gap:6px}\n"
+			".kr{flex:1;text-align:right} .vc{flex:1;text-align:left}\n",
 			mapname, gametype );
 
 		// Per-icon background-image rules, emitted only for icons that actually appear
