@@ -18,31 +18,47 @@
 #include <shellapi.h>
 #include <GL/gl.h>
 
+// stb_image FIRST, before reader.cpp — the CoD2 engine headers define a global `cm`
+// (the clipMap_t collision map) that would otherwise shadow stb_image's local `cm`
+// and break its compile.
+#define STB_IMAGE_IMPLEMENTATION
+#define STBI_ONLY_JPEG
+#define STBI_ONLY_PNG
+#include "imgui/stb_image.h"
+
 #include "reader.cpp"
 
 #include "imgui/imgui.h"
 #include "imgui/backends/imgui_impl_win32.h"
 #include "imgui/backends/imgui_impl_opengl3.h"
 
+#include "gui_assets.h"   // g_logoJpg + g_robotoTtf (embedded)
+
 extern IMGUI_IMPL_API LRESULT ImGui_ImplWin32_WndProcHandler( HWND, UINT, WPARAM, LPARAM );
+
+// fonts (loaded in WinMain), logo texture (built once on first frame)
+static ImFont *g_fontBody = NULL;
+static ImFont *g_fontH1   = NULL;
+static GLuint  g_logoTex  = 0;
+static int     g_logoW = 0, g_logoH = 0;
 
 // ---- operations -------------------------------------------------------------------
 enum { OP_INFO = 0, OP_SKIPDEAD, OP_CUT, OP_REMOVEHUD, OP_CLEAN, OP_OVERVIEW, OP_COUNT };
 static const char *kOpNames[ OP_COUNT ] = {
-	"Info  (what is this demo?)",
+	"Info  -  what is this demo?",
 	"Skip dead-time",
-	"Cut to time range",
+	"Cut to a time range",
 	"Remove HUD",
 	"Clean text  (chat / prints)",
-	"Match overview  (HTML)",
+	"Match overview  (HTML report)",
 };
 static const char *kOpBlurb[ OP_COUNT ] = {
-	"Read the demo and show version, map, gametype, length and players.",
-	"Remove every death->respawn stretch (the dead-stare, killcam and spectating) and re-time so the action plays back-to-back.",
-	"Keep only a time range and play it from the start.",
-	"Strip the server-set HUD overlays (kill cards, logos, score popups).",
-	"Remove chat, centre prints and/or the bottom-left console feed.",
-	"Write a self-contained HTML match report (killfeed with icons, chat, scores) and open it.",
+	"Read the demo and show its version, map, gametype, length and players. Doesn't change anything.",
+	"Cuts out every death -> respawn stretch (the dead-stare, the killcam, and any spectating) and re-times the demo so the action plays back-to-back. Tick the box below to keep the kill replays.",
+	"Keep only the chosen time range and play it from the start. Times are mm:ss, plain seconds, or the words start / end.",
+	"Strip the server-added HUD overlays (kill cards, server logos, score pop-ups). The ammo and compass are drawn by the game, not stored in the demo, so they stay.",
+	"Remove chat, the big centre prints, and/or the bottom-left console feed. Scores and gameplay are kept.",
+	"Build a shareable HTML match report - the killfeed with weapon icons, chat, and the final score - and open it in your browser.",
 };
 static const char *kOpSuffix[ OP_COUNT ] = { "", "skipdead", "cut", "nohud", "clean", "" };
 
@@ -211,6 +227,23 @@ static void ApplyCoD2Theme( void )
 	c[ ImGuiCol_Separator ]       = ImVec4( 0.25f, 0.22f, 0.05f, 1.0f );
 }
 
+// Decode the embedded logo JPEG and upload it as an OpenGL texture (once). Safe to call
+// every frame — it no-ops after the first success.
+static void EnsureLogoTexture( void )
+{
+	if ( g_logoTex ) return;
+	int n = 0;
+	unsigned char *px = stbi_load_from_memory( g_logoJpg, (int)g_logoJpg_len,
+		&g_logoW, &g_logoH, &n, 4 );
+	if ( !px ) return;
+	glGenTextures( 1, &g_logoTex );
+	glBindTexture( GL_TEXTURE_2D, g_logoTex );
+	glTexParameteri( GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR );
+	glTexParameteri( GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR );
+	glTexImage2D( GL_TEXTURE_2D, 0, GL_RGBA, g_logoW, g_logoH, 0, GL_RGBA, GL_UNSIGNED_BYTE, px );
+	stbi_image_free( px );
+}
+
 // ---- the panel --------------------------------------------------------------------
 static void DrawUI( HWND hwnd )
 {
@@ -221,12 +254,25 @@ static void DrawUI( HWND hwnd )
 		ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoMove |
 		ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_NoBringToFrontOnFocus );
 
-	// heading
-	ImGui::PushStyleColor( ImGuiCol_Text, ImVec4( 0.95f, 0.78f, 0.22f, 1.0f ) );
-	ImGui::SetWindowFontScale( 1.5f );
-	ImGui::TextUnformatted( "CoD2  DEMO  TOOL" );
-	ImGui::SetWindowFontScale( 1.0f );
+	EnsureLogoTexture();
+
+	// ---- header: logo + title + tagline -------------------------------------------
+	float logoSz = 44.0f;
+	if ( g_logoTex )
+	{
+		ImGui::Image( (ImTextureID)(intptr_t)g_logoTex, ImVec2( logoSz, logoSz ) );
+		ImGui::SameLine( 0.0f, 14.0f );
+	}
+	ImGui::BeginGroup();
+	if ( g_fontH1 ) ImGui::PushFont( g_fontH1 );
+	ImGui::PushStyleColor( ImGuiCol_Text, ImVec4( 0.95f, 0.78f, 0.22f, 1.0f ) );  // CoD2 gold
+	ImGui::TextUnformatted( "CoD2 Demo Tool" );
 	ImGui::PopStyleColor();
+	if ( g_fontH1 ) ImGui::PopFont();
+	ImGui::TextDisabled( "Trim dead-time, cut clips, and read your demos - no command line." );
+	ImGui::EndGroup();
+
+	ImGui::Spacing();
 	ImGui::Separator();
 	ImGui::Spacing();
 
@@ -353,7 +399,7 @@ int WINAPI WinMain( HINSTANCE hInst, HINSTANCE hPrev, LPSTR lpCmdLine, int nShow
 	RegisterClassExA( &wc );
 
 	HWND hwnd = CreateWindowExA( WS_EX_ACCEPTFILES, wc.lpszClassName, "CoD2 Demo Tool",
-		WS_OVERLAPPEDWINDOW, CW_USEDEFAULT, CW_USEDEFAULT, 640, 620,
+		WS_OVERLAPPEDWINDOW, CW_USEDEFAULT, CW_USEDEFAULT, 660, 680,
 		NULL, NULL, hInst, NULL );
 
 	if ( !CreateGLContext( hwnd ) )
@@ -364,7 +410,17 @@ int WINAPI WinMain( HINSTANCE hInst, HINSTANCE hPrev, LPSTR lpCmdLine, int nShow
 
 	IMGUI_CHECKVERSION();
 	ImGui::CreateContext();
-	ImGui::GetIO().IniFilename = NULL;   // don't litter an imgui.ini beside the exe
+	ImGuiIO &io = ImGui::GetIO();
+	io.IniFilename = NULL;   // don't litter an imgui.ini beside the exe
+
+	// Bundled Roboto (embedded) for a clean, crisp UI — no system-font dependency. The
+	// font bytes are owned by the static array, so tell ImGui not to free them.
+	ImFontConfig fc;
+	fc.FontDataOwnedByAtlas = false;
+	g_fontBody = io.Fonts->AddFontFromMemoryTTF( (void *)g_robotoTtf, (int)g_robotoTtf_len, 17.0f, &fc );
+	g_fontH1   = io.Fonts->AddFontFromMemoryTTF( (void *)g_robotoTtf, (int)g_robotoTtf_len, 28.0f, &fc );
+	if ( !g_fontBody ) g_fontBody = io.Fonts->AddFontDefault();   // fallback
+
 	ApplyCoD2Theme();
 	ImGui_ImplWin32_InitForOpenGL( hwnd );
 	ImGui_ImplOpenGL3_Init( "#version 130" );
