@@ -211,7 +211,18 @@ static void RunSelected( HWND hwnd )
 	FILE *redir = freopen( tmp, "w", stdout );
 	(void)redir;
 
+	// Full state hygiene before every op (the GUI reuses one process; the CLI got a
+	// fresh one per run). ResetFilters() zeros the filter flags; we also reset the
+	// decoder bookkeeping that lives outside cl/clc (the demo handle, the skip-dead
+	// ping-pong ring, the overview event buffer) and silence the verbose per-frame
+	// log — without g_quietLog a single op writes a ~28 MB <demo>.log and takes ~14 s.
 	ResetFilters();
+	memset( &demo, 0, sizeof( demo ) );
+	g_sfValid = qfalse;
+	g_sfCur   = 0;
+	g_ovNumEvents = 0;
+	g_quietLog = 1;
+
 	int rc = 0;
 	switch ( op )
 	{
