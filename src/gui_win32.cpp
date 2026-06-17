@@ -196,6 +196,14 @@ static void RunSelected( HWND hwnd )
 	}
 	int op = (int)SendMessageA( g_opC, CB_GETCURSEL, 0, 0 );
 
+	// Write-ops need an output path; Info has none.
+	if ( op != OP_INFO && !out[ 0 ] )
+	{
+		MessageBoxA( hwnd, "Set an output filename (the \"Save as\" box).",
+			"No output", MB_OK | MB_ICONWARNING );
+		return;
+	}
+
 	// temp capture file in %TEMP%
 	char tmp[ 1024 ];
 	char tdir[ 800 ] = { 0 };
@@ -257,6 +265,11 @@ static void RunSelected( HWND hwnd )
 		break;
 	}
 
+	// Tail a clear status line into the same capture file before detaching it.
+	if ( rc != 0 )
+		printf( "\n[failed] could not %s this demo.\n", kOpNames[ op ] );
+	else if ( op != OP_INFO && out[ 0 ] )
+		printf( "\n[done] wrote %s\n", out );
 	fflush( stdout );
 	freopen( "NUL", "w", stdout );   // detach the temp file so we can read it
 
