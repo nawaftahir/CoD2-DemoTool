@@ -17,7 +17,7 @@ BIN      := bin/cod2-demotool
 WINCXX   := i686-w64-mingw32-g++
 WINBIN   := bin/cod2-demotool.exe
 
-.PHONY: all win clean
+.PHONY: all win win-gui clean
 all: $(BIN)
 
 $(BIN): $(SRC) src/declarations.hpp src/writer.h
@@ -30,5 +30,11 @@ $(BIN): $(SRC) src/declarations.hpp src/writer.h
 win: $(SRC) src/declarations.hpp src/writer.h src/win/version.rc
 	./build-win.sh
 
+# The windowed front-end (double-click target). gui_win32.cpp #includes reader.cpp
+# under GUI_BUILD and is built -mwindows (GUI subsystem, no console). Same dockcross
+# toolchain as `win`.
+win-gui: src/gui_win32.cpp $(SRC) src/declarations.hpp src/writer.h src/win/version.rc
+	./build-win-gui.sh
+
 clean:
-	rm -f $(BIN) $(WINBIN) bin/version.o
+	rm -f $(BIN) $(WINBIN) bin/cod2-demotool-gui.exe bin/version.o bin/version-gui.o
