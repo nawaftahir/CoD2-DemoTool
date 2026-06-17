@@ -5,6 +5,15 @@ Human-friendly summaries of what changed in CoD2-DemoTool.
 ## [nightly] — unreleased
 
 ### Added
+- **Windows GUI (`cod2-demotool-gui.exe`)** — a proper window so you don't need the
+  command line, with a dark **CoD2-menu look** (amber/gold accent). Double-click to open
+  it, **drag a demo in** (or click Browse), pick what to do from a dropdown — Info, Skip
+  dead-time, Cut, Remove HUD, Clean text, or Match overview — set the output name (filled
+  in for you), and click **Run**. The result shows in the window; the overview opens the
+  HTML in your browser. No console window, no flags. The command-line `cod2-demotool.exe`
+  is unchanged for scripts and power users. Build it with `make win-gui` (or
+  `./build-win-gui.sh`). Built with ImGui on a Win32 + OpenGL backend, so it
+  cross-compiles from Linux/WSL with the same toolchain as the CLI.
 - **`--info`** — read any CoD2 demo and print a one-glance summary: game version,
   map, gametype, length, frame count, players, and the server's hostname. The game
   version is detected automatically from inside the demo.
@@ -81,6 +90,11 @@ Human-friendly summaries of what changed in CoD2-DemoTool.
   demo. Handy for dropping a folder of demos onto the tool on Windows.
 
 ### Fixed
+- **`--info` could crash, and was needlessly slow.** Reading one demo (or dropping a
+  single file on the exe) could segfault, and even when it didn't it spent ~14 seconds
+  writing a ~28 MB debug log just to print a five-line summary — which is a big part of
+  why a double-clicked exe seemed to "do nothing." `--info` now reads in about a second
+  and writes no log. (Use `--dump` for the full per-frame trace.)
 - Demo length and player count were wrong on demos whose serverTime resets mid-recording
   (e.g. a map restart) — length could even go negative. Length now tracks the peak time,
   and the decoder is fully reset between demos so a batch run can't carry state across.
