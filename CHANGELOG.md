@@ -94,6 +94,20 @@ Human-friendly summaries of what changed in CoD2-DemoTool.
   the timer it's drawn from lives in a second HUD array that wasn't being re-timed.
   Both HUD arrays are now shifted, so timers (respawn, round clock, bomb timer) read
   correctly across a cut.
+- **The red "you're hurt" screen flash could bleed into the next spawn.** If you took
+  damage just before dying, the flash is triggered by a value that the game normally
+  clears on respawn — but skip-dead deletes the respawn frame, so the flash carried
+  over into your fresh life. Skip-dead now carries that damage state cleanly across
+  each cut so the new spawn starts with a clean screen. (Also fixes a stray flash at
+  a `--cut` seam that lands in a firefight.)
+
+### Notes on what `--skip-dead` removes
+- Kill messages ("You killed X" / "Killed by X") that happened **while you were dead**
+  are removed along with the dead-time — that killfeed scrolled by during the seconds
+  the tool is cutting out, so it goes with them. Your **own** death messages come back
+  with `keep-killcam` (the killcam that follows your killer carries them). This is by
+  design: skip-dead removes the time you were dead, and the killfeed from that time
+  goes with it.
 
 ### Notes
 - A single binary reads demos from **every CoD2 version** — 1.0, 1.2, 1.3, and

@@ -2964,7 +2964,7 @@ static int Demo_TranscodeFrame( const byte *frame, int frameLen, FILE *out, int 
 				storedFrame_t *prev = g_sfValid ? &g_sf[ g_sfCur ^ 1 ] : NULL;
 				storedFrame_t *cur  = &g_sf[ g_sfCur ];
 				if ( !prev ) isCut = qtrue;
-				SkipExtractFrame( cur, skip->timeOffset, isCut );
+				SkipExtractFrame( cur, skip->timeOffset, isCut, prev );
 				SV_WriteSkipSnapshot( prev, cur, &omsg );
 				g_sfCur ^= 1;
 				g_sfValid = qtrue;

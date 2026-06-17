@@ -602,9 +602,34 @@ static void ClearEntityEvents( entityState_t *e )
 	for ( int i = 0; i < 4; i++ ) { e->events[ i ] = 0; e->eventParms[ i ] = 0; }
 	e->eventParm = 0;
 }
-static void ClearPlayerstateEvents( playerState_t *ps )
+// Splice hygiene for the red damage blend / view-damage kick at a cut seam. `prev`
+// is the previous KEPT frame (NULL on the very first output frame).
+//
+// CoD2's client plays a view-damage animation on the EDGE — whenever ps.damageEvent
+// CHANGES between two played snapshots (P_DamageFeedback, "always increment ... we do
+// multiple view damage anims", CoD2rev g_active_mp.cpp:402) — and renders the red
+// blend with intensity ps.damageCount. On a normal respawn ClientSpawn memsets the
+// playerstate, zeroing both in one frame; skip-dead DELETES that frame. The delta
+// then carries the dying player's high damageEvent across the splice, and because the
+// previous kept frame (pre-death) held a *different* damageEvent, the client sees a
+// change and fires a phantom screen-kick + red flash into the fresh life.
+//
+// The fix is NOT to zero damageEvent (prev still differs -> still an edge), but to
+// make the seam frame's damageEvent EQUAL the previous kept frame's -> no edge, no
+// anim. damageCount/yaw/pitch are zeroed (no new blend this frame) and the relative
+// stumble counters (damageTimer/damageDuration, ms not serverTimes) are zeroed so a
+// half-decayed stumble can't bleed in. If the player is genuinely still hurt, the
+// next real snapshot re-supplies live values and the engine re-fires normally.
+static void ClearPlayerstateEvents( playerState_t *ps, const playerState_t *prev )
 {
 	for ( int i = 0; i < 4; i++ ) { ps->events[ i ] = 0; ps->eventParms[ i ] = 0; }
+
+	ps->damageEvent    = prev ? prev->damageEvent : 0;   // match prev -> no edge -> no anim
+	ps->damageCount    = 0;
+	ps->damageYaw      = 0;
+	ps->damagePitch    = 0;
+	ps->damageTimer    = 0;
+	ps->damageDuration = 0;
 }
 
 // Entity-list delta. Mirrors CL_ParsePacketEntities / SV_EmitPacketEntities.
@@ -787,8 +812,10 @@ typedef struct
 } storedFrame_t;
 
 // Materialise cl.snap into `f`, re-timed by timeOffset. At a cut, drop stale ring
-// events and never carry one-shot temp/event entities across the splice.
-void SkipExtractFrame( storedFrame_t *f, int timeOffset, qboolean isCut )
+// events and never carry one-shot temp/event entities across the splice. `prev` is
+// the previous kept frame (NULL on the first output frame) — used at a seam to carry
+// the damage-anim edge across without re-firing it.
+void SkipExtractFrame( storedFrame_t *f, int timeOffset, qboolean isCut, const storedFrame_t *prev )
 {
 	f->valid      = qtrue;
 	f->serverTime = cl.snap.serverTime - timeOffset;
@@ -797,7 +824,7 @@ void SkipExtractFrame( storedFrame_t *f, int timeOffset, qboolean isCut )
 	f->ps = cl.snap.ps;
 	RetimePlayerstate( &f->ps, timeOffset );
 	if ( isCut )
-		ClearPlayerstateEvents( &f->ps );
+		ClearPlayerstateEvents( &f->ps, ( prev && prev->valid ) ? &prev->ps : NULL );
 
 	f->numEnts = 0;
 	for ( int i = 0; i < cl.snap.numEntities && f->numEnts < MAX_GENTITIES; i++ )
