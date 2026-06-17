@@ -6,3 +6,15 @@
 *.dm_1
 *.dm_1.log
 *.log
+
+# Asset pipeline (iwi -> dds -> png). Only the small killfeed icons used by the
+# HTML overview (assets/icons/, baked into src/icons_embed.h) need to be in the repo.
+# The raw/intermediate conversions and the full-size master PNGs are reproducible and
+# large, so they stay out.
+assets/iwi_originals/
+assets/dds_converted/
+assets/png_final/
+
+
+# strings layer deferred (large; mod-variable) — see scripts/extract_to_json.py
+assets/localization.json
