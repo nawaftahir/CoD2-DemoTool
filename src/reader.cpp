@@ -2823,8 +2823,10 @@ typedef struct
 	// skip-dead
 	int inDeadSpan;            // currently inside a death->respawn span
 	int deathTime;             // serverTime the current dead span began (start of a dropped run)
-	int keepKillcam;           // 1 = keep killcam frames (follow-the-killer), cut only own-body dead
-	int killcamKept;           // diagnostic: killcam frames kept (when keepKillcam)
+	int keepKillcam;           // 1 = keep killcam / follow-another-player frames
+	int killcamKept;           // diagnostic: killcam/follow frames kept
+	int keepSpectate;          // 1 = keep free-float spectate frames (pm 4)
+	int spectateKept;          // diagnostic: free-spectate frames kept
 	// cut
 	int firstTime;             // serverTime of the first snapshot (captured once)
 	int haveFirst;
@@ -2959,10 +2961,12 @@ static int Demo_TranscodeFrame( const byte *frame, int frameLen, FILE *out, int 
 			{
 				frameState_t fs = ClassifyFrame( &cl.snap.ps, clc.clientNum );
 
-				// Keep only the recorder alive in their own body. --keep-killcam also
-				// keeps killcam frames (following the killer); own-body dead and
-				// free-spectate are always dropped.
-				int keep;
+				// Keep the recorder alive in their own body, plus whatever the keep
+				// flags ask for. keep-killcam keeps killcam / following-another-player
+				// frames (PMF_FOLLOW); keep-spectate keeps free-float spectate (pm 4).
+				// The own-body dead-stare (pm 6/7) is always dropped. With both flags on,
+				// everything except the dead-stare is kept.
+				int keep = 0;
 				if ( fs == ST_ALIVE )
 					keep = 1;
 				else if ( skip->keepKillcam && fs == ST_DEAD_OR_KILLCAM
@@ -2971,8 +2975,11 @@ static int Demo_TranscodeFrame( const byte *frame, int frameLen, FILE *out, int 
 					keep = 1;
 					skip->killcamKept++;
 				}
-				else
-					keep = 0;
+				else if ( skip->keepSpectate && fs == ST_FREE_SPECTATE )
+				{
+					keep = 1;
+					skip->spectateKept++;
+				}
 
 				// Re-time by the total dropped duration so far. Accumulating the gap
 				// since the previous snapshot is correct whether the whole dead span
@@ -3074,9 +3081,10 @@ static int Cmd_Copy( const char *inPath, const char *outPath )
 }
 
 // --skip-dead : drop every death->respawn span and re-time, into a new playable demo.
-// keepKillcam: keep the killcam (the few seconds following the killer after a death)
-// and cut only the own-body dead-stare and any free-spectate.
-static int Cmd_SkipDead( const char *inPath, const char *outPath, int keepKillcam )
+// keepKillcam:  keep killcam / following-another-player frames (cut only the dead-stare).
+// keepSpectate: keep free-float spectate frames too. Both on => keep everything but the
+// own-body dead-stare.
+static int Cmd_SkipDead( const char *inPath, const char *outPath, int keepKillcam, int keepSpectate )
 {
 	snprintf( logFileName, sizeof( logFileName ), "%s.skip.log", inPath );
 	FILE *lf = fopen( logFileName, "w" ); if ( lf ) fclose( lf );
@@ -3097,7 +3105,8 @@ static int Cmd_SkipDead( const char *inPath, const char *outPath, int keepKillca
 
 	skipState_t skip;
 	memset( &skip, 0, sizeof( skip ) );
-	skip.keepKillcam = keepKillcam;
+	skip.keepKillcam  = keepKillcam;
+	skip.keepSpectate = keepSpectate;
 	g_sfValid = qfalse;
 	g_sfCur   = 0;
 
@@ -3126,12 +3135,15 @@ static int Cmd_SkipDead( const char *inPath, const char *outPath, int keepKillca
 		kept, skip.dropped, sec, skip.timeOffset % 1000, skip.forceFulls );
 	if ( err ) printf( "  [%d errors]", err );
 	printf( "  ->  %s\n", outPath );
-	if ( keepKillcam )
-		printf( "  kept %d killcam frames (--keep-killcam): you still see each kill replay,\n"
-		        "  only the dead-stare and spectating were removed\n", skip.killcamKept );
+	if ( keepKillcam || keepSpectate )
+	{
+		if ( keepKillcam )  printf( "  kept %d killcam/follow frames (keep-killcam)\n", skip.killcamKept );
+		if ( keepSpectate ) printf( "  kept %d free-spectate frames (keep-spectate)\n", skip.spectateKept );
+		printf( "  only the own-body dead-stare was removed\n" );
+	}
 	else
-		printf( "  killcam and spectating were cut too (default). Use --keep-killcam to keep the\n"
-		        "  kill replays.\n" );
+		printf( "  killcam and spectating were cut too (default). Add keep-killcam and/or\n"
+		        "  keep-spectate to keep those.\n" );
 	// If the demo ended while the player was still dead (never respawned), every
 	// remaining frame was dropped — warn so a truncated tail isn't a surprise.
 	if ( skip.inDeadSpan )
@@ -4247,7 +4259,7 @@ static void Usage( void )
 	printf( "  cod2-demotool --hudscan <demo.dm_1>          list the scripted HUD elements (what --remove-hud strips)\n" );
 	printf( "  cod2-demotool --overview <demo.dm_1> [out.html]   match timeline: kills, chat, score (HTML optional)\n" );
 	printf( "  cod2-demotool --copy       <in.dm_1> <out.dm_1>          re-encode unchanged (round-trip proof)\n" );
-	printf( "  cod2-demotool --skip-dead  <in.dm_1> <out.dm_1> [keep-killcam]  remove dead-time (+killcam)\n" );
+	printf( "  cod2-demotool --skip-dead  <in.dm_1> <out.dm_1> [keep-killcam] [keep-spectate]  remove dead-time\n" );
 	printf( "  cod2-demotool --cut        <in.dm_1> <out.dm_1> <s> <e>  keep only the time range [s, e]\n" );
 	printf( "  cod2-demotool --clean      <in.dm_1> <out.dm_1> <what>   strip chat / centertext / whitetext / all\n" );
 	printf( "  cod2-demotool --remove-hud <in.dm_1> <out.dm_1> [keep <shader>]   strip server-set HUD elements\n" );
@@ -4354,11 +4366,16 @@ int main( int argc, char **argv )
 	{
 		if ( !path2 )
 		{
-			printf( "usage: cod2-demotool --skip-dead <in.dm_1> <out.dm_1> [keep-killcam]\n" );
+			printf( "usage: cod2-demotool --skip-dead <in.dm_1> <out.dm_1> [keep-killcam] [keep-spectate]\n" );
 			return 1;
 		}
-		int keepKillcam = ( path3 && !strcmp( path3, "keep-killcam" ) );
-		return Cmd_SkipDead( path, path2, keepKillcam );
+		int keepKillcam = 0, keepSpectate = 0;
+		for ( int i = 2; i < np; i++ )         // scan trailing keywords in any order
+		{
+			if ( !strcmp( p[ i ], "keep-killcam" ) )  keepKillcam = 1;
+			if ( !strcmp( p[ i ], "keep-spectate" ) ) keepSpectate = 1;
+		}
+		return Cmd_SkipDead( path, path2, keepKillcam, keepSpectate );
 	}
 
 	// --clean <in> <out> <what...> : strip server-command text (chat / centertext / whitetext).

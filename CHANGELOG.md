@@ -27,9 +27,12 @@ Human-friendly summaries of what changed in CoD2-DemoTool.
 - **`--skip-dead`** — the headline feature: removes every death-to-respawn stretch —
   the dead-stare, the **killcam** (the seconds spent watching your killer), and any
   spectating — and re-times the demo so the action plays back-to-back in an unmodified
-  CoD2 client. A 15:20 CTF match plays in ~12:24 (~3 minutes of dead-time and killcams
-  removed). Add **`keep-killcam`** (`--skip-dead in out keep-killcam`) to keep the kill
-  replays and trim only the dead-stare/spectating instead (15:20 → 14:31).
+  CoD2 client. You choose how much of the not-playing time to keep:
+  - default — action only (cut the dead-stare, killcam and spectating);
+  - `keep-killcam` — also keep the killcam / footage where you're following another player;
+  - `keep-spectate` — also keep your free-cam (free-float) spectating;
+  - both keywords — keep everything except the own-body dead-stare.
+  e.g. `--skip-dead in out keep-killcam keep-spectate`.
 - **`--deadscan`** — diagnostic that lists where the player is dead, so you can see
   exactly what `--skip-dead` will cut before running it.
 - **`--commands`** — list every server command in the demo by time (chat, announcements,

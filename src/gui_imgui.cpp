@@ -67,6 +67,7 @@ static char  g_input[ 1024 ]   = { 0 };
 static char  g_output[ 1024 ]  = { 0 };
 static int   g_op              = OP_INFO;
 static bool  g_keepKillcam     = false;
+static bool  g_keepSpectate    = false;
 static char  g_cutStart[ 64 ]  = "start";
 static char  g_cutEnd[ 64 ]    = "end";
 // Clean-text defaults: OFF. Picking "Clean text" must not silently strip anything —
@@ -163,7 +164,7 @@ static void RunSelected( HWND hwnd )
 	switch ( g_op )
 	{
 	case OP_INFO:      rc = Cmd_Info( g_input ); break;
-	case OP_SKIPDEAD:  rc = Cmd_SkipDead( g_input, g_output, g_keepKillcam ? 1 : 0 ); break;
+	case OP_SKIPDEAD:  rc = Cmd_SkipDead( g_input, g_output, g_keepKillcam ? 1 : 0, g_keepSpectate ? 1 : 0 ); break;
 	case OP_CUT:       rc = Cmd_Cut( g_input, g_output,
 	                                 g_cutStart[ 0 ] ? g_cutStart : "start",
 	                                 g_cutEnd[ 0 ]   ? g_cutEnd   : "end" ); break;
@@ -307,7 +308,10 @@ static void DrawUI( HWND hwnd )
 
 	// per-op extras
 	if ( g_op == OP_SKIPDEAD )
-		ImGui::Checkbox( "Keep the kill replays (only cut the dead-stare)", &g_keepKillcam );
+	{
+		ImGui::Checkbox( "Keep the killcam / following another player", &g_keepKillcam );
+		ImGui::Checkbox( "Keep free-spectate (free-cam) footage", &g_keepSpectate );
+	}
 	else if ( g_op == OP_CUT )
 	{
 		ImGui::PushItemWidth( 120 );
