@@ -3471,6 +3471,100 @@ static int Cmd_Merge( const char *inA, const char *inB, const char *outPath )
 
 // --deadscan : diagnostic — show where the local player is dead (pm_type >= PM_DEAD)
 // so we can see the dead/respawn spans skip-dead will remove.
+// Friendly name for a hudelem type (he_type_t).
+static const char *HudTypeName( int t )
+{
+	switch ( t )
+	{
+	case HE_TYPE_TEXT:       return "text";
+	case HE_TYPE_VALUE:      return "value";
+	case HE_TYPE_PLAYERNAME: return "playername";
+	case HE_TYPE_MAPNAME:    return "mapname";
+	case HE_TYPE_GAMETYPE:   return "gametype";
+	case HE_TYPE_MATERIAL:   return "material/icon";
+	case HE_TYPE_TIMER_DOWN: return "timer";
+	default:                 return "other";
+	}
+}
+
+// --hudscan : list the distinct scripted HUD elements a demo carries (the things
+// --remove-hud strips). Each line shows the element type, its on-screen position, and
+// — for icons — the shader name, which is exactly what `--remove-hud keep <name>` matches.
+// Built-in readouts (ammo, weapon name, grenade count, compass) are NOT here: the client
+// draws those from the player's own state, they're not stored as HUD elements.
+static int Cmd_HudScan( const char *path )
+{
+	snprintf( logFileName, sizeof( logFileName ), "%s.hudscan.log", path );
+	FILE *lf = fopen( logFileName, "w" ); if ( lf ) fclose( lf );
+	g_quietLog = 1;
+
+	if ( !FS_FOpenFileRead( path, &demo.demofile, qtrue ) || !demo.demofile )
+	{
+		printf( "error: cannot open '%s'\n", path );
+		return 1;
+	}
+
+	// Collect distinct elements by a simple key (type | materialIndex | text | label).
+	// HUD elements live in the playerstate every frame; we only want each unique one once.
+	struct { int type, mat, text, label; int seen; char shader[ 64 ]; } seen[ 256 ];
+	int nSeen = 0;
+
+	while ( CL_ReadDemoMessage() )
+	{
+		snapshot_t snapshot;
+		if ( !CL_GetSnapshot( cl.snap.messageNum, &snapshot ) )
+			continue;
+
+		for ( int pass = 0; pass < 2; pass++ )
+		{
+			hudelem_t *arr = ( pass == 0 ) ? cl.snap.ps.hud.current : cl.snap.ps.hud.archival;
+			int count = ( pass == 0 ) ? MAX_HUDELEMS_CURRENT : MAX_HUDELEMS_ARCHIVAL;
+			for ( int i = 0; i < count; i++ )
+			{
+				hudelem_t *h = &arr[ i ];
+				if ( h->type == HE_TYPE_FREE )
+					break;                            // packed array — tail is empty
+				int dup = 0;
+				for ( int k = 0; k < nSeen; k++ )
+					if ( seen[ k ].type == h->type && seen[ k ].mat == h->materialIndex &&
+					     seen[ k ].text == h->text && seen[ k ].label == h->label )
+					{ seen[ k ].seen++; dup = 1; break; }
+				if ( dup || nSeen >= 256 ) continue;
+
+				seen[ nSeen ].type  = h->type;
+				seen[ nSeen ].mat   = h->materialIndex;
+				seen[ nSeen ].text  = h->text;
+				seen[ nSeen ].label = h->label;
+				seen[ nSeen ].seen  = 1;
+				seen[ nSeen ].shader[ 0 ] = 0;
+				if ( h->materialIndex )
+				{
+					const char *s = CL_ConfigString( CS_SHADERS + h->materialIndex );
+					Q_strncpyz( seen[ nSeen ].shader, s, sizeof( seen[ 0 ].shader ) );
+				}
+				nSeen++;
+			}
+		}
+	}
+
+	fclose( demo.demofile );
+	demo.demofile = NULL;
+	g_quietLog = 0;
+
+	printf( "\n  %d distinct scripted HUD element(s) in this demo:\n\n", nSeen );
+	printf( "  %-14s %-32s %s\n", "type", "shader (for keep <name>)", "frames" );
+	printf( "  %-14s %-32s %s\n", "----", "------------------------", "------" );
+	for ( int k = 0; k < nSeen; k++ )
+		printf( "  %-14s %-32s %d\n",
+			HudTypeName( seen[ k ].type ),
+			seen[ k ].shader[ 0 ] ? seen[ k ].shader : "-",
+			seen[ k ].seen );
+	printf( "\n  --remove-hud strips all of these. Keep one with:  --remove-hud in out keep <shader>\n" );
+	printf( "  The ammo / weapon name / grenade count / compass are NOT here — the game draws\n" );
+	printf( "  those from the player's own state, so they aren't stored as removable elements.\n" );
+	return 0;
+}
+
 static int Cmd_DeadScan( const char *path )
 {
 	snprintf( logFileName, sizeof( logFileName ), "%s.scan.log", path );
@@ -4150,6 +4244,7 @@ static void Usage( void )
 	printf( "  cod2-demotool --info  <demo.dm_1>            show what a demo is (version, map, length)\n" );
 	printf( "  cod2-demotool --dump  <demo.dm_1>            write a verbose per-frame log (debug)\n" );
 	printf( "  cod2-demotool --commands <demo.dm_1>         list the server commands (chat, events) by time\n" );
+	printf( "  cod2-demotool --hudscan <demo.dm_1>          list the scripted HUD elements (what --remove-hud strips)\n" );
 	printf( "  cod2-demotool --overview <demo.dm_1> [out.html]   match timeline: kills, chat, score (HTML optional)\n" );
 	printf( "  cod2-demotool --copy       <in.dm_1> <out.dm_1>          re-encode unchanged (round-trip proof)\n" );
 	printf( "  cod2-demotool --skip-dead  <in.dm_1> <out.dm_1> [keep-killcam]  remove dead-time (+killcam)\n" );
@@ -4372,6 +4467,9 @@ int main( int argc, char **argv )
 
 	if ( !strcmp( mode, "--deadscan" ) )
 		return Cmd_DeadScan( path );
+
+	if ( !strcmp( mode, "--hudscan" ) )
+		return Cmd_HudScan( path );
 
 	if ( !strcmp( mode, "--commands" ) )
 		return Cmd_Commands( path );

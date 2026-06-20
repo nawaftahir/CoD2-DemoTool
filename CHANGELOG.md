@@ -35,6 +35,12 @@ Human-friendly summaries of what changed in CoD2-DemoTool.
 - **`--commands`** — list every server command in the demo by time (chat, announcements,
   cvar pushes, configstring updates). Player chat is decoded and labelled. This is the
   demo's event channel — the groundwork for a killfeed/chat overview.
+- **`--hudscan`** — list every scripted HUD element a demo carries (team icons, damage
+  feedback, flag indicators, score popups, timers, …) with its shader name. This shows
+  exactly what `--remove-hud` will strip, and gives you the name to keep one with
+  `--remove-hud in out keep <shader>` (e.g. `keep damage_feedback`). The ammo / weapon
+  name / grenade count / compass aren't listed because the game draws those from the
+  player's own state — they aren't stored as removable elements.
 - **`--overview`** — the demo's full match timeline: the killfeed (who killed whom,
   when, and with what — real player and weapon names, plus headshot/melee/suicide/
   falling deaths), with **player chat, server announcements, and team-score changes
