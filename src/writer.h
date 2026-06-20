@@ -630,6 +630,13 @@ static void ClearPlayerstateEvents( playerState_t *ps, const playerState_t *prev
 	ps->damagePitch    = 0;
 	ps->damageTimer    = 0;
 	ps->damageDuration = 0;
+
+	// Same idea for the shellshock/concussion blur: a fresh spawn across a cut must not
+	// carry a concussion that was active before the cut. (The first kept frame after a
+	// death is a respawn, where these are already 0 in the source; clearing also covers
+	// a --cut that lands mid-blur.)
+	ps->shellshockTime     = 0;
+	ps->shellshockDuration = 0;
 }
 
 // Entity-list delta. Mirrors CL_ParsePacketEntities / SV_EmitPacketEntities.
