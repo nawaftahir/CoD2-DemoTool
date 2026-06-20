@@ -837,8 +837,13 @@ void SkipExtractFrame( storedFrame_t *f, int timeOffset, qboolean isCut, const s
 	for ( int i = 0; i < cl.snap.numEntities && f->numEnts < MAX_GENTITIES; i++ )
 	{
 		entityState_t *e = &cl.parseEntities[ ( cl.snap.parseEntitiesNum + i ) & ( MAX_PARSE_ENTITIES - 1 ) ];
-		if ( isCut && e->eType >= ET_EVENTS )
-			continue;                          // don't re-introduce a one-shot impact at a cut
+		// At a cut, drop one-shot event entities so impacts/sounds don't re-fire — EXCEPT
+		// the obituary (eType 208 = ET_EVENTS + EV_OBITUARY), which is just a broadcast
+		// kill message. Showing the kill once at the seam is what we want (this is why
+		// keep-killcam used to lose the "killed by X" message at the start of the killcam),
+		// and unlike an impact it doesn't loop or stick.
+		if ( isCut && e->eType >= ET_EVENTS && e->eType != 208 )
+			continue;
 		entityState_t n = *e;
 		RetimeEntity( &n, timeOffset );
 		if ( isCut )
