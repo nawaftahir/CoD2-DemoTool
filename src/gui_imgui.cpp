@@ -69,9 +69,12 @@ static int   g_op              = OP_INFO;
 static bool  g_keepKillcam     = false;
 static char  g_cutStart[ 64 ]  = "start";
 static char  g_cutEnd[ 64 ]    = "end";
-static bool  g_cleanChat       = true;
-static bool  g_cleanCenter     = true;
-static bool  g_cleanWhite      = true;
+// Clean-text defaults: OFF. Picking "Clean text" must not silently strip anything —
+// in particular "console prints" (iprintln) is where some mods put their kill feed, so
+// defaulting it on would quietly remove kills. The user ticks exactly what they want.
+static bool  g_cleanChat       = false;
+static bool  g_cleanCenter     = false;
+static bool  g_cleanWhite      = false;
 static char  g_log[ 1 << 16 ]  = "Drag a .dm_1 demo onto the window, pick what to do, and press Run.";
 static bool  g_busy            = false;
 
@@ -138,6 +141,11 @@ static void RunSelected( HWND hwnd )
 	if ( g_busy ) return;
 	if ( !g_input[ 0 ] ) { Q_strncpyz( g_log, "Drag a .dm_1 demo in, or use Browse.", sizeof( g_log ) ); return; }
 	if ( g_op != OP_INFO && !g_output[ 0 ] ) { Q_strncpyz( g_log, "Set an output filename first.", sizeof( g_log ) ); return; }
+	if ( g_op == OP_CLEAN && !g_cleanChat && !g_cleanCenter && !g_cleanWhite )
+	{
+		Q_strncpyz( g_log, "Nothing ticked to strip. Tick chat, centre prints, or console prints first.", sizeof( g_log ) );
+		return;
+	}
 
 	char tmp[ 1024 ], tdir[ 800 ] = { 0 };
 	GetTempPathA( sizeof( tdir ), tdir );
@@ -315,6 +323,8 @@ static void DrawUI( HWND hwnd )
 		ImGui::Checkbox( "chat", &g_cleanChat ); ImGui::SameLine();
 		ImGui::Checkbox( "centre prints", &g_cleanCenter ); ImGui::SameLine();
 		ImGui::Checkbox( "console prints", &g_cleanWhite );
+		if ( g_cleanWhite )
+			ImGui::TextDisabled( "  note: \"console prints\" also removes the kill feed on mods that print kills there." );
 	}
 
 	// output

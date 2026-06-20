@@ -90,6 +90,14 @@ Human-friendly summaries of what changed in CoD2-DemoTool.
   demo. Handy for dropping a folder of demos onto the tool on Windows.
 
 ### Fixed
+- **The killfeed showed the wrong weapon on every kill (off by one).** The weapon list
+  is 1-based, but the decoder read it 0-based, so each kill showed the *next* weapon in
+  the list - frag-grenade kills appeared as smoke grenades, shotgun kills as binoculars,
+  and so on. Fixed; the killfeed now names the exact weapon for every kill. (Caught
+  because smoke grenades and binoculars can't actually kill.)
+- **"Clean text" no longer strips anything by accident.** Its three options now start
+  unticked, and "console prints" is flagged because on some mods the kill feed is printed
+  there - so cleaning it would remove the kills. You tick exactly what you want gone.
 - **`--info` could crash, and was needlessly slow.** Reading one demo (or dropping a
   single file on the exe) could segfault, and even when it didn't it spent ~14 seconds
   writing a ~28 MB debug log just to print a five-line summary — which is a big part of

@@ -3892,8 +3892,12 @@ static int Cmd_Overview( const char *path, const char *htmlPath )
 
 			char how[ 48 ];
 			int  headshot = ( parm & 0x80 ) && ( parm & 0x7f ) == 8;
+			// The weapon index is 1-based: CS_WEAPONS is built from weapon index 1
+			// (SaveRegisteredWeapons in CoD2rev), so token[0] is weapon 1 and weapon
+			// `parm` lives at token[parm-1]. Using weapons[parm] shifted every weapon
+			// by one (frag kills showed as smoke, shotgun showed as binoculars, etc.).
 			if ( parm & 0x80 )                            Q_strncpyz( how, MeansOfDeathName( parm & 0x7f ), sizeof( how ) );
-			else if ( parm >= 0 && parm < nWeapons )      Q_strncpyz( how, weapons[ parm ], sizeof( how ) );
+			else if ( parm >= 1 && parm - 1 < nWeapons )  Q_strncpyz( how, weapons[ parm - 1 ], sizeof( how ) );
 			else                                          snprintf( how, sizeof( how ), "weapon %d", parm );
 
 			if ( victim >= 0 && victim < MAX_CLIENTS ) stDeaths[ victim ]++;
