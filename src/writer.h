@@ -165,7 +165,8 @@ void MSG_WriteDeltaField( msg_t *msg, const void *from, const void *to, const ne
 	int *fromF = ( int * )( (byte *)from + field->offset );
 	int *toF   = ( int * )( (byte *)to   + field->offset );
 
-	AttrMark( msg->cursize, field->name, field->bits );
+	g_attrCursize = msg->cursize;
+	AttrMark( msg->bit, field->name, field->bits );
 
 	if ( *fromF == *toF )
 	{
@@ -313,7 +314,8 @@ void MSG_WriteDeltaStruct( msg_t *msg, const void *from, const void *to, qboolea
 
 void MSG_WriteDeltaEntity( msg_t *msg, entityState_t *from, entityState_t *to, qboolean force )
 {
-	AttrMark( msg->cursize, to ? "entity" : "entity-remove", to ? *(int *)to : *(int *)from );
+	g_attrCursize = msg->cursize;
+	AttrMark( msg->bit, to ? "entity" : "entity-remove", to ? *(int *)to : *(int *)from );
 	MSG_WriteDeltaStruct( msg, (byte *)from, (byte *)to, force,
 		COUNT_OF( entityStateFields ), GENTITYNUM_BITS, entityStateFields, qfalse );
 }

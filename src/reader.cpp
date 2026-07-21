@@ -2527,12 +2527,13 @@ static int g_secPlayerstate = -1, g_secEntities = -1, g_secClients = -1;
 // label, entity/field) at each entity boundary and each written field, so --verify can
 // re-transcode the one divergent frame and map the divergent byte to the exact entity+field.
 #define ATTR_MAX 8192
-typedef struct { int off; const char *label; int num; } attrMark_t;
+typedef struct { int off; int byteoff; const char *label; int num; } attrMark_t;
 static attrMark_t g_attr[ ATTR_MAX ];
 static int g_attrN = 0, g_attrOn = 0;
+static int g_attrCursize = 0;   // set by encoders to the current cursize when AttrMark fires
 static inline void AttrMark( int off, const char *label, int num )
 {
-	if ( g_attrOn && g_attrN < ATTR_MAX ) { g_attr[ g_attrN ].off = off; g_attr[ g_attrN ].label = label; g_attr[ g_attrN ].num = num; g_attrN++; }
+	if ( g_attrOn && g_attrN < ATTR_MAX ) { g_attr[ g_attrN ].off = off; g_attr[ g_attrN ].byteoff = g_attrCursize; g_attr[ g_attrN ].label = label; g_attr[ g_attrN ].num = num; g_attrN++; }
 }
 
 // The encoder (inverse of the decoder above). Pulled in here so it sees the
@@ -3103,6 +3104,11 @@ static int Cmd_Verify( const char *path )
 	while ( Demo_ReadRawFrame( demo.demofile, &seq, frame, &len ) )
 	{
 		cap.origLen = cap.reencLen = 0;
+		// Mirror the real demo playback: the frame's sequence number drives
+		// clc.serverMessageSequence, which snapshot delta references depend on.
+		// (Every other command loop sets this; --verify must too, or delta
+		// frames decode as non-delta and the re-encode falsely diverges.)
+		clc.serverMessageSequence = seq;
 		int r = Demo_TranscodeFrame( frame, len, NULL, seq, NULL );
 		frames++;
 		if ( r != 1 ) { errors++; continue; }         // e.g. svc_download / overflow
@@ -3185,9 +3191,11 @@ static int Cmd_Verify( const char *path )
 			Demo_TranscodeFrame( firstFrameBuf, firstFrameLen, NULL, firstFrameSeq, NULL );
 			g_attrOn = 0;
 			int mi = -1, curEnt = -1; const char *curField = "?";
+			// Attribute by BYTE offset (cursize) — reliable, since MSG_WriteByte/Short/Long
+			// advance cursize but NOT msg->bit (so bit markers go stale after byte writes).
 			for ( int k = 0; k < g_attrN; k++ )
 			{
-				if ( g_attr[ k ].off > firstByte ) break;
+				if ( g_attr[ k ].byteoff > firstByte ) break;
 				mi = k;
 			}
 			if ( mi >= 0 )
@@ -3196,10 +3204,14 @@ static int Cmd_Verify( const char *path )
 				for ( int k = mi; k >= 0; k-- )
 					if ( strstr( g_attr[ k ].label, "entity" ) ) { curEnt = g_attr[ k ].num; break; }
 				curField = g_attr[ mi ].label;
-				printf( "    -> at field '%s'", curField );
+				int fStart = g_attr[ mi ].byteoff, fEnd = ( mi + 1 < g_attrN ) ? g_attr[ mi + 1 ].byteoff : -1;
+				printf( "    -> at field '%s' (bits=%d)", curField, g_attr[ mi ].num );
 				if ( curEnt >= 0 ) printf( "  (entity %d)", curEnt );
-				printf( "   [marker off %d, next %d]\n", g_attr[ mi ].off,
-					( mi + 1 < g_attrN ) ? g_attr[ mi + 1 ].off : -1 );
+				printf( "   [field bytes %d..%d, firstByte %d]\n", fStart, fEnd, firstByte );
+				// show a few surrounding markers for context
+				for ( int k = ( mi > 2 ? mi - 2 : 0 ); k < g_attrN && k <= mi + 2; k++ )
+					printf( "         marker[%d] byte %d bit %d  %s (num=%d)\n",
+						k, g_attr[ k ].byteoff, g_attr[ k ].off, g_attr[ k ].label, g_attr[ k ].num );
 			}
 		}
 		else
