@@ -2523,6 +2523,18 @@ int FS_FOpenFileRead( const char *filename, FILE **file, qboolean uniqueFILE )
 // divergence falls in (playerstate / entities / clients) instead of a raw offset.
 static int g_secPlayerstate = -1, g_secEntities = -1, g_secClients = -1;
 
+// --verify field attribution: when g_attrOn, the encoders record a marker (byte offset,
+// label, entity/field) at each entity boundary and each written field, so --verify can
+// re-transcode the one divergent frame and map the divergent byte to the exact entity+field.
+#define ATTR_MAX 8192
+typedef struct { int off; const char *label; int num; } attrMark_t;
+static attrMark_t g_attr[ ATTR_MAX ];
+static int g_attrN = 0, g_attrOn = 0;
+static inline void AttrMark( int off, const char *label, int num )
+{
+	if ( g_attrOn && g_attrN < ATTR_MAX ) { g_attr[ g_attrN ].off = off; g_attr[ g_attrN ].label = label; g_attr[ g_attrN ].num = num; g_attrN++; }
+}
+
 // The encoder (inverse of the decoder above). Pulled in here so it sees the
 // field tables, msg_t and the MSG_Read* helpers defined earlier in this TU.
 #include "writer.h"
@@ -3086,6 +3098,7 @@ static int Cmd_Verify( const char *path )
 	int firstOrigComp = 0, firstReComp = 0, firstCompDiffByte = -1;
 	int fSecPS = -1, fSecEnt = -1, fSecCli = -1;   // section offsets of the first divergent snapshot
 	static byte winOrig[ 48 ], winReenc[ 48 ]; int winStart = 0, winN = 0;
+	static byte firstFrameBuf[ MAX_MSGLEN ]; int firstFrameLen = 0, firstFrameSeq = 0;
 
 	while ( Demo_ReadRawFrame( demo.demofile, &seq, frame, &len ) )
 	{
@@ -3114,6 +3127,7 @@ static int Cmd_Verify( const char *path )
 			firstFrame = frames - 1; firstSvc = svc;
 			firstOrigComp = origComp; firstReComp = compLen; firstCompDiffByte = compDiff;
 			fSecPS = g_secPlayerstate; fSecEnt = g_secEntities; fSecCli = g_secClients;
+			memcpy( firstFrameBuf, frame, len ); firstFrameLen = len; firstFrameSeq = seq;
 			// Localize in the UNCOMPRESSED domain: first byte where the re-encoded message
 			// (omsg = cap.reenc) differs from the original decompressed (dmsg = cap.orig),
 			// within the re-encoded length (garbage lives beyond it, so it can't false-hit).
@@ -3163,6 +3177,30 @@ static int Cmd_Verify( const char *path )
 				firstByte, firstBit, sec );
 			printf( "    (snapshot sections start at: playerstate=%d entities=%d clients=%d)\n",
 				fSecPS, fSecEnt, fSecCli );
+
+			// Second pass: re-transcode just this frame with field attribution on, then map
+			// firstByte to the entity + field whose marker precedes it.
+			g_attrOn = 1; g_attrN = 0;
+			cap.origLen = cap.reencLen = 0;
+			Demo_TranscodeFrame( firstFrameBuf, firstFrameLen, NULL, firstFrameSeq, NULL );
+			g_attrOn = 0;
+			int mi = -1, curEnt = -1; const char *curField = "?";
+			for ( int k = 0; k < g_attrN; k++ )
+			{
+				if ( g_attr[ k ].off > firstByte ) break;
+				mi = k;
+			}
+			if ( mi >= 0 )
+			{
+				// walk back to the enclosing entity for context
+				for ( int k = mi; k >= 0; k-- )
+					if ( strstr( g_attr[ k ].label, "entity" ) ) { curEnt = g_attr[ k ].num; break; }
+				curField = g_attr[ mi ].label;
+				printf( "    -> at field '%s'", curField );
+				if ( curEnt >= 0 ) printf( "  (entity %d)", curEnt );
+				printf( "   [marker off %d, next %d]\n", g_attr[ mi ].off,
+					( mi + 1 < g_attrN ) ? g_attr[ mi + 1 ].off : -1 );
+			}
 		}
 		else
 			printf( "    uncompressed content matches; divergence is length/encoding (comp byte %d)\n",
