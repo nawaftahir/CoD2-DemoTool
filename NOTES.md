@@ -405,3 +405,25 @@ info → Run anyway"; (5) MS false-positive portal if quarantined. Code signing 
   SV_WriteSkipSnapshot, which kept their event-clearing). Re-verified --copy 0/0 after.
 - Removed the disabled legacy CoD2-DemoParser `main_legacy()` block.
 - README rewritten to match the actual feature set.
+
+## P4 byte-1:1 progress (verify harness)
+- **Fixed a --verify-only bug:** the loop never set `clc.serverMessageSequence = seq` (every other
+  command loop does). With messageNum stuck at 0, `deltaNum = messageNum - deltaNumByte` went negative,
+  so every delta snapshot decoded as non-delta against the wrong `from`. Fix drops false divergences
+  ~80% (p115 3999->760, p117 729, p118 1017, cod2x 154).
+- **Attribution now by byte offset (cursize), not msg->bit.** `MSG_WriteByte/Short/Long` advance cursize
+  but NOT msg->bit, so bit markers go stale right after any byte-aligned write (e.g. a small-int float's
+  trailing byte). Byte markers are reliable; use them to map the first divergent byte to entity+field.
+- **Remaining divergences are a real non-canonical-encoding class, and the tool is semantically 1:1**
+  on them (verified: --copy then --dump both -> every decoded field value identical; only the readcount
+  prefixes shift by the few bits the re-encode differs). The pattern: in a snapshot whose header is
+  non-delta (deltaNumByte=0, old=NULL), an entity float that goes nonzero->0 across frames is emitted by
+  the recording engine as "changed then zero-bit" (2 bits), which is only possible if its delta `from`
+  was the *previous frame's* value, not the static gamestate baseline (0). Proof: p115 frame2 entity4
+  `pos.trDelta[2]` was SMALLINT -1 in frame1 and encodes as changed->zero in frame2 — impossible from a
+  baseline of 0 (that would be an "unchanged" 1-bit). CoD2rev's stock server (SV_WriteSnapshotToClient
+  passes oldframe=NULL when non-delta; SV_CreateBaseline only baselines linked map ents, never players)
+  would emit the 1-bit form, so these client demos were produced against a `from` = previous frame for
+  entities even on non-delta headers. NEXT: reproduce by having the encoder (and, losslessly, the
+  decoder) use the previous decoded frame's parseEntities as the entity `from` on non-delta snapshots,
+  then re-verify. Open design question to confirm with a wider corpus before committing that change.
