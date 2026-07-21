@@ -3052,11 +3052,14 @@ static int Demo_TranscodeFrame( const byte *frame, int frameLen, FILE *out, int 
 	return 1;
 }
 
-// --verify : byte-compare round-trip. For each frame, decode -> re-encode -> compare the
-// two UNCOMPRESSED bitstreams (dmsg vs omsg). Reports the first divergent frame, the byte
-// + bit offset of the first difference, and a hex window around it. The gate for a true
-// 1:1 reverse is 0 divergent frames across a whole demo corpus. Exit: 0 = identical,
-// 2 = diverged, 1 = open error.
+// --verify : the byte-1:1 gate. For each frame, decode -> re-encode -> RE-COMPRESS and
+// compare the result to the ORIGINAL on-disk compressed payload. That on-disk compare is
+// the real definition of "1:1" (the output file must equal the input file). Comparing the
+// UNCOMPRESSED payloads is NOT valid: the decompressor over-reads the trailing padding bits
+// of the byte-aligned stream and emits spurious garbage bytes past the message's svc_EOF,
+// which the game ignores but which would false-flag a perfect re-encode. So: on-disk bytes
+// gate it, and the uncompressed omsg-vs-dmsg content diff only LOCALIZES where it went wrong.
+// Exit: 0 = every frame 1:1, 2 = divergence found, 1 = open error.
 static int Cmd_Verify( const char *path )
 {
 	snprintf( logFileName, sizeof( logFileName ), "%s.verify.log", path );
@@ -3072,10 +3075,10 @@ static int Cmd_Verify( const char *path )
 	static verifyCapture_t cap;
 	g_verifyCap = &cap;
 
-	static byte frame[ MAX_MSGLEN ];
-	int seq, len, frames = 0, diverged = 0, errors = 0;
-	int lenOnly = 0, content = 0, gsDiv = 0;      // classes: length-only vs content diff; gamestate diffs
-	int firstFrame = -1, firstByte = -1, firstBit = -1, firstOrigLen = 0, firstReencLen = 0;
+	static byte frame[ MAX_MSGLEN ], comp[ MAX_MSGLEN ];
+	int seq, len, frames = 0, diverged = 0, errors = 0, gsDiv = 0, snapDiv = 0;
+	int firstFrame = -1, firstByte = -1, firstBit = -1, firstSvc = -1;
+	int firstOrigComp = 0, firstReComp = 0, firstCompDiffByte = -1;
 	static byte winOrig[ 48 ], winReenc[ 48 ]; int winStart = 0, winN = 0;
 
 	while ( Demo_ReadRawFrame( demo.demofile, &seq, frame, &len ) )
@@ -3085,28 +3088,38 @@ static int Cmd_Verify( const char *path )
 		frames++;
 		if ( r != 1 ) { errors++; continue; }         // e.g. svc_download / overflow
 
-		int n = ( cap.origLen < cap.reencLen ) ? cap.origLen : cap.reencLen;
-		int badByte = -1;
-		for ( int i = 0; i < n; i++ )
-			if ( cap.orig[ i ] != cap.reenc[ i ] ) { badByte = i; break; }
-		int lenDiff = ( cap.origLen != cap.reencLen );
-		if ( badByte < 0 && !lenDiff )
-			continue;                                 // this frame is byte-identical
+		// THE GATE: re-compress the re-encoded message, compare to the original on-disk
+		// compressed payload (frame = [reliableAck(4)][compressed]; compare compressed part).
+		int compLen  = MSG_WriteBitsCompress( cap.reenc, comp, cap.reencLen );
+		int origComp = len - 4;
+		int cn = ( compLen < origComp ) ? compLen : origComp;
+		int compDiff = -1;
+		for ( int i = 0; i < cn; i++ )
+			if ( comp[ i ] != frame[ 4 + i ] ) { compDiff = i; break; }
+		if ( compDiff < 0 && compLen == origComp )
+			continue;                                 // on-disk byte-identical — 1:1 for this frame
 
 		diverged++;
-		if ( badByte >= 0 ) content++; else lenOnly++;
-		if ( cap.orig[ 0 ] == svc_gamestate ) gsDiv++;
-		// Capture the first CONTENT divergence (bytes actually differ) — that's the real
-		// target. A length-only diff (e.g. the gamestate trailing byte) is reported separately.
-		if ( firstFrame < 0 && badByte >= 0 )
+		int svc = cap.reenc[ 0 ];
+		if ( svc == svc_gamestate ) gsDiv++; else snapDiv++;
+
+		if ( firstFrame < 0 )
 		{
-			firstFrame = frames - 1;
-			firstOrigLen = cap.origLen; firstReencLen = cap.reencLen;
-			firstByte = badByte;
-			byte x = cap.orig[ badByte ] ^ cap.reenc[ badByte ];
-			int b = 0; while ( b < 8 && !( x & ( 1 << b ) ) ) b++;
-			firstBit = badByte * 8 + b;
-			winStart = badByte - 8; if ( winStart < 0 ) winStart = 0;
+			firstFrame = frames - 1; firstSvc = svc;
+			firstOrigComp = origComp; firstReComp = compLen; firstCompDiffByte = compDiff;
+			// Localize in the UNCOMPRESSED domain: first byte where the re-encoded message
+			// (omsg = cap.reenc) differs from the original decompressed (dmsg = cap.orig),
+			// within the re-encoded length (garbage lives beyond it, so it can't false-hit).
+			int un = ( cap.reencLen < cap.origLen ) ? cap.reencLen : cap.origLen;
+			for ( int i = 0; i < un; i++ )
+				if ( cap.reenc[ i ] != cap.orig[ i ] ) { firstByte = i; break; }
+			if ( firstByte >= 0 )
+			{
+				byte x = cap.orig[ firstByte ] ^ cap.reenc[ firstByte ];
+				int b = 0; while ( b < 8 && !( x & ( 1 << b ) ) ) b++;
+				firstBit = firstByte * 8 + b;
+				winStart = firstByte - 8; if ( winStart < 0 ) winStart = 0;
+			}
 			winN = 32;
 			if ( winStart + winN > cap.origLen )  winN = cap.origLen  - winStart;
 			if ( winStart + winN > cap.reencLen ) winN = cap.reencLen - winStart;
@@ -3120,25 +3133,26 @@ static int Cmd_Verify( const char *path )
 	g_verifyCap = NULL; g_quietLog = 0;
 
 	printf( "\n  verify %s\n", path );
-	printf( "  %d frames: %d byte-identical, %d diverged, %d decode-errors\n",
+	printf( "  %d frames: %d byte-identical (on disk), %d diverged, %d decode-errors\n",
 		frames, frames - diverged - errors, diverged, errors );
-	if ( diverged )
-		printf( "  divergence classes: %d content (bytes differ), %d length-only, %d in gamestate frames\n",
-			content, lenOnly, gsDiv );
 	if ( !diverged && !errors )
 	{
 		printf( "  -> BYTE-IDENTICAL round-trip. 1:1 for this demo.\n" );
 		return 0;
 	}
+	if ( diverged )
+		printf( "  diverged: %d gamestate, %d snapshot\n", gsDiv, snapDiv );
 	if ( firstFrame >= 0 )
 	{
-		printf( "  first divergence: frame %d  (orig payload %d B, re-encoded %d B)\n",
-			firstFrame, firstOrigLen, firstReencLen );
+		printf( "  first divergence: frame %d (svc 0x%02x)  compressed %d B -> %d B\n",
+			firstFrame, firstSvc, firstOrigComp, firstReComp );
 		if ( firstByte >= 0 )
-			printf( "    first differing byte %d  = bit %d of the uncompressed payload\n", firstByte, firstBit );
+			printf( "    re-encode first differs from original at uncompressed byte %d (bit %d)\n",
+				firstByte, firstBit );
 		else
-			printf( "    same bytes up to the shorter length; lengths differ\n" );
-		printf( "    window from byte %d (orig / re-encoded):\n    ", winStart );
+			printf( "    uncompressed content matches; divergence is length/encoding (comp byte %d)\n",
+				firstCompDiffByte );
+		printf( "    window from byte %d (original / re-encoded uncompressed):\n    ", winStart );
 		for ( int i = 0; i < winN; i++ ) printf( "%02x ", winOrig[ i ] );
 		printf( "\n    " );
 		for ( int i = 0; i < winN; i++ ) printf( "%02x ", winReenc[ i ] );
