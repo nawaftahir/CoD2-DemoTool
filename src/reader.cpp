@@ -2872,6 +2872,17 @@ static storedFrame_t g_sf[ 2 ];
 static int           g_sfCur   = 0;
 static qboolean      g_sfValid = qfalse;
 
+// --verify capture. When g_verifyCap is set, Demo_TranscodeFrame stashes the ORIGINAL
+// decompressed payload (dmsg) and the RE-ENCODED payload (omsg) here so the caller can
+// byte-compare the two UNCOMPRESSED bitstreams — that's where any divergence originates
+// and localizes cleanly (Huffman is a fixed table, so if the uncompressed streams match,
+// the on-disk compressed bytes match too). Off by default (NULL).
+typedef struct {
+	byte orig[ MAX_MSGLEN ];  int origLen;
+	byte reenc[ MAX_MSGLEN ]; int reencLen;
+} verifyCapture_t;
+static verifyCapture_t *g_verifyCap = NULL;
+
 // Transcode one frame: decode each svc command (updating decoder state) and emit
 // the equivalent into a fresh uncompressed message, then frame it to `out`.
 // `skip` NULL = exact copy; non-NULL = skip-dead (drop dead frames, re-time).
@@ -3029,8 +3040,112 @@ static int Demo_TranscodeFrame( const byte *frame, int frameLen, FILE *out, int 
 	if ( omsg.overflowed )
 		return -1;
 
-	Demo_WriteFrame( out, seq, reliableAck, omsg.data, omsg.cursize );
+	if ( g_verifyCap )
+	{
+		g_verifyCap->origLen  = dmsg.cursize;
+		g_verifyCap->reencLen = omsg.cursize;
+		memcpy( g_verifyCap->orig,  dmsg.data, dmsg.cursize );
+		memcpy( g_verifyCap->reenc, omsg.data, omsg.cursize );
+	}
+	if ( out )                     // --verify passes out=NULL (compare only, no write)
+		Demo_WriteFrame( out, seq, reliableAck, omsg.data, omsg.cursize );
 	return 1;
+}
+
+// --verify : byte-compare round-trip. For each frame, decode -> re-encode -> compare the
+// two UNCOMPRESSED bitstreams (dmsg vs omsg). Reports the first divergent frame, the byte
+// + bit offset of the first difference, and a hex window around it. The gate for a true
+// 1:1 reverse is 0 divergent frames across a whole demo corpus. Exit: 0 = identical,
+// 2 = diverged, 1 = open error.
+static int Cmd_Verify( const char *path )
+{
+	snprintf( logFileName, sizeof( logFileName ), "%s.verify.log", path );
+	FILE *lf = fopen( logFileName, "w" ); if ( lf ) fclose( lf );
+	g_quietLog = 1;
+
+	if ( !FS_FOpenFileRead( path, &demo.demofile, qtrue ) || !demo.demofile )
+	{
+		printf( "error: cannot open '%s'\n", path );
+		return 1;
+	}
+
+	static verifyCapture_t cap;
+	g_verifyCap = &cap;
+
+	static byte frame[ MAX_MSGLEN ];
+	int seq, len, frames = 0, diverged = 0, errors = 0;
+	int lenOnly = 0, content = 0, gsDiv = 0;      // classes: length-only vs content diff; gamestate diffs
+	int firstFrame = -1, firstByte = -1, firstBit = -1, firstOrigLen = 0, firstReencLen = 0;
+	static byte winOrig[ 48 ], winReenc[ 48 ]; int winStart = 0, winN = 0;
+
+	while ( Demo_ReadRawFrame( demo.demofile, &seq, frame, &len ) )
+	{
+		cap.origLen = cap.reencLen = 0;
+		int r = Demo_TranscodeFrame( frame, len, NULL, seq, NULL );
+		frames++;
+		if ( r != 1 ) { errors++; continue; }         // e.g. svc_download / overflow
+
+		int n = ( cap.origLen < cap.reencLen ) ? cap.origLen : cap.reencLen;
+		int badByte = -1;
+		for ( int i = 0; i < n; i++ )
+			if ( cap.orig[ i ] != cap.reenc[ i ] ) { badByte = i; break; }
+		int lenDiff = ( cap.origLen != cap.reencLen );
+		if ( badByte < 0 && !lenDiff )
+			continue;                                 // this frame is byte-identical
+
+		diverged++;
+		if ( badByte >= 0 ) content++; else lenOnly++;
+		if ( cap.orig[ 0 ] == svc_gamestate ) gsDiv++;
+		// Capture the first CONTENT divergence (bytes actually differ) — that's the real
+		// target. A length-only diff (e.g. the gamestate trailing byte) is reported separately.
+		if ( firstFrame < 0 && badByte >= 0 )
+		{
+			firstFrame = frames - 1;
+			firstOrigLen = cap.origLen; firstReencLen = cap.reencLen;
+			firstByte = badByte;
+			byte x = cap.orig[ badByte ] ^ cap.reenc[ badByte ];
+			int b = 0; while ( b < 8 && !( x & ( 1 << b ) ) ) b++;
+			firstBit = badByte * 8 + b;
+			winStart = badByte - 8; if ( winStart < 0 ) winStart = 0;
+			winN = 32;
+			if ( winStart + winN > cap.origLen )  winN = cap.origLen  - winStart;
+			if ( winStart + winN > cap.reencLen ) winN = cap.reencLen - winStart;
+			if ( winN < 0 ) winN = 0;
+			memcpy( winOrig,  cap.orig  + winStart, winN );
+			memcpy( winReenc, cap.reenc + winStart, winN );
+		}
+	}
+
+	fclose( demo.demofile ); demo.demofile = NULL;
+	g_verifyCap = NULL; g_quietLog = 0;
+
+	printf( "\n  verify %s\n", path );
+	printf( "  %d frames: %d byte-identical, %d diverged, %d decode-errors\n",
+		frames, frames - diverged - errors, diverged, errors );
+	if ( diverged )
+		printf( "  divergence classes: %d content (bytes differ), %d length-only, %d in gamestate frames\n",
+			content, lenOnly, gsDiv );
+	if ( !diverged && !errors )
+	{
+		printf( "  -> BYTE-IDENTICAL round-trip. 1:1 for this demo.\n" );
+		return 0;
+	}
+	if ( firstFrame >= 0 )
+	{
+		printf( "  first divergence: frame %d  (orig payload %d B, re-encoded %d B)\n",
+			firstFrame, firstOrigLen, firstReencLen );
+		if ( firstByte >= 0 )
+			printf( "    first differing byte %d  = bit %d of the uncompressed payload\n", firstByte, firstBit );
+		else
+			printf( "    same bytes up to the shorter length; lengths differ\n" );
+		printf( "    window from byte %d (orig / re-encoded):\n    ", winStart );
+		for ( int i = 0; i < winN; i++ ) printf( "%02x ", winOrig[ i ] );
+		printf( "\n    " );
+		for ( int i = 0; i < winN; i++ ) printf( "%02x ", winReenc[ i ] );
+		printf( "\n" );
+	}
+	printf( "  -> NOT 1:1 yet (expected in development; chase divergences to 0).\n" );
+	return 2;
 }
 
 // --copy : round-trip a demo through decode->encode. Proves the writer.
@@ -4259,6 +4374,7 @@ static void Usage( void )
 	printf( "  cod2-demotool --hudscan <demo.dm_1>          list the scripted HUD elements (what --remove-hud strips)\n" );
 	printf( "  cod2-demotool --overview <demo.dm_1> [out.html]   match timeline: kills, chat, score (HTML optional)\n" );
 	printf( "  cod2-demotool --copy       <in.dm_1> <out.dm_1>          re-encode unchanged (round-trip proof)\n" );
+	printf( "  cod2-demotool --verify     <demo.dm_1>                   byte-compare round-trip (is the reverse 1:1?)\n" );
 	printf( "  cod2-demotool --skip-dead  <in.dm_1> <out.dm_1> [keep-killcam] [keep-spectate]  remove dead-time\n" );
 	printf( "  cod2-demotool --cut        <in.dm_1> <out.dm_1> <s> <e>  keep only the time range [s, e]\n" );
 	printf( "  cod2-demotool --clean      <in.dm_1> <out.dm_1> <what>   strip chat / centertext / whitetext / all\n" );
@@ -4351,6 +4467,9 @@ int main( int argc, char **argv )
 		Usage();
 		return 1;
 	}
+
+	if ( !strcmp( mode, "--verify" ) )
+		return Cmd_Verify( path );
 
 	if ( !strcmp( mode, "--copy" ) )
 	{
