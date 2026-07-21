@@ -2518,6 +2518,11 @@ int FS_FOpenFileRead( const char *filename, FILE **file, qboolean uniqueFILE )
 	return ( *file != NULL );
 }
 
+// --verify section attribution: byte offsets in the re-encoded snapshot where each
+// section begins (set by SV_WriteSnapshot). Lets --verify name which section a
+// divergence falls in (playerstate / entities / clients) instead of a raw offset.
+static int g_secPlayerstate = -1, g_secEntities = -1, g_secClients = -1;
+
 // The encoder (inverse of the decoder above). Pulled in here so it sees the
 // field tables, msg_t and the MSG_Read* helpers defined earlier in this TU.
 #include "writer.h"
@@ -3079,6 +3084,7 @@ static int Cmd_Verify( const char *path )
 	int seq, len, frames = 0, diverged = 0, errors = 0, gsDiv = 0, snapDiv = 0;
 	int firstFrame = -1, firstByte = -1, firstBit = -1, firstSvc = -1;
 	int firstOrigComp = 0, firstReComp = 0, firstCompDiffByte = -1;
+	int fSecPS = -1, fSecEnt = -1, fSecCli = -1;   // section offsets of the first divergent snapshot
 	static byte winOrig[ 48 ], winReenc[ 48 ]; int winStart = 0, winN = 0;
 
 	while ( Demo_ReadRawFrame( demo.demofile, &seq, frame, &len ) )
@@ -3107,6 +3113,7 @@ static int Cmd_Verify( const char *path )
 		{
 			firstFrame = frames - 1; firstSvc = svc;
 			firstOrigComp = origComp; firstReComp = compLen; firstCompDiffByte = compDiff;
+			fSecPS = g_secPlayerstate; fSecEnt = g_secEntities; fSecCli = g_secClients;
 			// Localize in the UNCOMPRESSED domain: first byte where the re-encoded message
 			// (omsg = cap.reenc) differs from the original decompressed (dmsg = cap.orig),
 			// within the re-encoded length (garbage lives beyond it, so it can't false-hit).
@@ -3147,8 +3154,16 @@ static int Cmd_Verify( const char *path )
 		printf( "  first divergence: frame %d (svc 0x%02x)  compressed %d B -> %d B\n",
 			firstFrame, firstSvc, firstOrigComp, firstReComp );
 		if ( firstByte >= 0 )
-			printf( "    re-encode first differs from original at uncompressed byte %d (bit %d)\n",
-				firstByte, firstBit );
+		{
+			const char *sec = "header";
+			if ( fSecCli >= 0 && firstByte >= fSecCli )       sec = "clients";
+			else if ( fSecEnt >= 0 && firstByte >= fSecEnt )  sec = "entities";
+			else if ( fSecPS >= 0 && firstByte >= fSecPS )    sec = "playerstate";
+			printf( "    re-encode first differs from original at uncompressed byte %d (bit %d) -> %s section\n",
+				firstByte, firstBit, sec );
+			printf( "    (snapshot sections start at: playerstate=%d entities=%d clients=%d)\n",
+				fSecPS, fSecEnt, fSecCli );
+		}
 		else
 			printf( "    uncompressed content matches; divergence is length/encoding (comp byte %d)\n",
 				firstCompDiffByte );

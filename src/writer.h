@@ -746,8 +746,11 @@ void SV_WriteSnapshot( clSnapshot_t *snap, msg_t *msg )
 	MSG_WriteByte( msg, lastframe );
 	MSG_WriteByte( msg, snap->snapFlags );
 
+	g_secPlayerstate = msg->cursize;                        // --verify section markers
 	MSG_WriteDeltaPlayerstate( msg, old ? &old->ps : NULL, &snap->ps );
+	g_secEntities = msg->cursize;
 	SV_EmitPacketEntities( old, snap, msg );
+	g_secClients = msg->cursize;
 	SV_EmitPacketClients( old, snap, msg );
 }
 

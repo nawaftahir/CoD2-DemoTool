@@ -21,3 +21,7 @@ assets/localization.json
 
 # generated test artifacts
 demos/test_outputs/*.html
+
+# corpus demo binaries (large; tracked by corpus/SHA256SUMS, kept off-repo)
+corpus/*.dm_1
+corpus/*.log
