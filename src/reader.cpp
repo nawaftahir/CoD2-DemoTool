@@ -38,6 +38,28 @@ void Com_Error(int err, char* fmt,...)
 }
 
 int g_quietLog = 0;   // when set, Com_Printf is a no-op (--copy avoids per-call fopen of the log)
+
+// Record-and-replay of playerstate delta decisions (byte-1:1 re-encode). The decoder
+// stashes the last playerstate's lc + per-field changed bits here; CL_ParseSnapshot
+// copies them into the snapshot. The encoder replays them when g_encReplay is set and
+// it is re-encoding against the original delta base (copy/verify/convert), else recomputes.
+int g_recPsLc = 0;
+byte g_recPsChanged[128];
+int g_encReplay = 0;                 // 1 = replay original encoding decisions verbatim
+const clSnapshot_t *g_encSnap = 0;   // the snapshot being encoded (source of replay decisions)
+
+// Same record-and-replay for entity/client delta-structs. The decoder captures each
+// struct's lc + per-field changed bits (MSG_ReadDeltaField reports its change bit via
+// g_fieldChangedBit); CL_DeltaEntity/Client store them in a ring parallel to
+// cl.parseEntities/parseClients; the encoder replays via g_encStructEnc.
+typedef struct { int lc; byte changed[128]; byte valid; } deltaEnc_t;
+int g_recStructLc = 0;
+byte g_recStructChanged[128];
+int g_fieldChangedBit = 0;
+static deltaEnc_t g_entEnc[MAX_PARSE_ENTITIES];
+static deltaEnc_t g_cliEnc[MAX_PARSE_CLIENTS];
+const deltaEnc_t *g_encStructEnc = 0;   // record for the entity/client currently being encoded
+int g_forceFieldChanged = -1;           // -1 = recompute changed-bit; 0/1 = replay this bit
 int g_dumpCommands = 0;   // when set, CL_ParseCommandString prints each server command (for --commands)
 
 // Server-command filters (Caball-style). Applied during transcode: a dropped
@@ -1342,9 +1364,11 @@ void MSG_ReadDeltaField(msg_t* msg, const void* from, const void* to, netField_t
 
 	if (!MSG_ReadBit(msg))
 	{
+		g_fieldChangedBit = 0;
 		*toF = *fromF;
 		return;
 	}
+	g_fieldChangedBit = 1;
 
 	switch (field->bits)
 	{
@@ -1394,7 +1418,13 @@ void MSG_ReadDeltaField(msg_t* msg, const void* from, const void* to, netField_t
 
 	case -100:
 		if (MSG_ReadBit(msg))
+		{
 			*(float*)toF = MSG_ReadAngle16(msg);
+			// present-bit=1 but the angle quantized to 0: recompute (which keys off *toF)
+			// would drop the present bit, so flag this field for present-forced replay.
+			if (*toF == 0)
+				g_fieldChangedBit = 2;
+		}
 		else
 			*toF = 0;
 		return;
@@ -1415,6 +1445,11 @@ void MSG_ReadDeltaField(msg_t* msg, const void* from, const void* to, netField_t
 			*toF = readbyte;
 			if (print)
 				Com_Printf("%s:%i ", field->name, *toF);
+			// present-bit=1 but the transmitted low bits are 0 (e.g. a mod-256 counter
+			// whose real value is a multiple of 256): recompute keys off *toF and would
+			// drop the present bit, so flag this field for present-forced replay.
+			if (*toF == 0)
+				g_fieldChangedBit = 2;
 		}
 		else
 			*toF = 0;
@@ -1427,6 +1462,8 @@ void MSG_ReadDeltaStruct(msg_t* msg, const void* from, void* to, unsigned int nu
 	netField_t* field;
 	int lc;
 	int i;
+
+	g_recStructLc = -1;   // -1 until the field-delta branch fills it (remove/no-delta = recompute)
 
 	// check for a remove
 	if (MSG_ReadBit(msg) == 1) {
@@ -1454,9 +1491,15 @@ void MSG_ReadDeltaStruct(msg_t* msg, const void* from, void* to, unsigned int nu
 
 	*(uint32_t*)to = number;
 
+	// Record the original per-field encoding decisions for byte-1:1 replay.
+	g_recStructLc = lc;
+	Com_Memset( g_recStructChanged, 0, sizeof( g_recStructChanged ) );
+
 	for (i = 0, field = stateFields; i < lc; i++, field++)
 	{
 		MSG_ReadDeltaField(msg, from, to, field, 1);
+		if ( i < 128 )
+			g_recStructChanged[ i ] = (byte)g_fieldChangedBit;
 	}
 
 	for (i = lc, field = &stateFields[lc]; i < numFields; i++, field++)
@@ -1562,6 +1605,10 @@ void MSG_ReadDeltaPlayerstate(msg_t *msg, playerState_t *from, playerState_t *to
 
 	lc = MSG_ReadByte( msg );
 
+	// Record the original encoding decisions for byte-1:1 replay.
+	g_recPsLc = lc;
+	Com_Memset( g_recPsChanged, 0, sizeof( g_recPsChanged ) );
+
 	for ( i = 0, field = playerStateFields ; i < lc ; i++, field++ )
 	{
 		fromF = ( int32_t * )( (byte *)from + field->offset );
@@ -1572,6 +1619,8 @@ void MSG_ReadDeltaPlayerstate(msg_t *msg, playerState_t *from, playerState_t *to
 			*toF = *fromF;
 			continue;
 		}
+		if ( i < (int)sizeof( g_recPsChanged ) )
+			g_recPsChanged[ i ] = 1;   // original wrote this field as changed
 
 		switch (field->bits)
 		{
@@ -1769,13 +1818,22 @@ void CL_DeltaEntity( msg_t *msg, clSnapshot_t *frame, int newnum, entityState_t 
 
 	// save the parsed entity state into the big circular buffer so
 	// it can be used as the source for a later delta
-	state = &cl.parseEntities[cl.parseEntitiesNum & ( MAX_PARSE_ENTITIES - 1 )];
+	int slot = cl.parseEntitiesNum & ( MAX_PARSE_ENTITIES - 1 );
+	state = &cl.parseEntities[slot];
 
 
 	if ( unchanged ) {
 		*state = *old;
+		g_entEnc[slot].valid = 0;
 	} else {
 		MSG_ReadDeltaEntity( msg, old, state, newnum );
+		// Record the original encoding decisions alongside the decoded entity.
+		g_entEnc[slot].valid = ( g_recStructLc >= 0 );
+		if ( g_entEnc[slot].valid )
+		{
+			g_entEnc[slot].lc = g_recStructLc;
+			Com_Memcpy( g_entEnc[slot].changed, g_recStructChanged, sizeof( g_entEnc[slot].changed ) );
+		}
 	}
 
 	if ( state->number == ( MAX_GENTITIES - 1 ) ) {
@@ -1795,13 +1853,21 @@ void CL_DeltaClient( msg_t *msg, clSnapshot_t *frame, int newnum, clientState_t 
 
 	// save the parsed entity state into the big circular buffer so
 	// it can be used as the source for a later delta
-	state = &cl.parseClients[cl.parseClientsNum & ( MAX_PARSE_CLIENTS - 1 )];
+	int slot = cl.parseClientsNum & ( MAX_PARSE_CLIENTS - 1 );
+	state = &cl.parseClients[slot];
 
 
 	if ( unchanged ) {
 		*state = *old;
+		g_cliEnc[slot].valid = 0;
 	} else {
 		MSG_ReadDeltaClient( msg, old, state, newnum );
+		g_cliEnc[slot].valid = ( g_recStructLc >= 0 );
+		if ( g_cliEnc[slot].valid )
+		{
+			g_cliEnc[slot].lc = g_recStructLc;
+			Com_Memcpy( g_cliEnc[slot].changed, g_recStructChanged, sizeof( g_cliEnc[slot].changed ) );
+		}
 	}
 
 	// asi neni
@@ -2141,6 +2207,9 @@ void CL_ParseSnapshot( msg_t *msg ) {
 	} else {
 		MSG_ReadDeltaPlayerstate( msg, NULL, &newSnap.ps );
 	}
+	// Capture the original playerstate encoding decisions for byte-1:1 replay.
+	newSnap.psLc = g_recPsLc;
+	Com_Memcpy( newSnap.psFieldChanged, g_recPsChanged, sizeof( newSnap.psFieldChanged ) );
 
 	// read packet entities
 	SHOWNET( msg, "packet entities" );
@@ -2921,6 +2990,11 @@ static int Demo_TranscodeFrame( const byte *frame, int frameLen, FILE *out, int 
 	static byte obuf[ MAX_MSGLEN ];
 	msg_t omsg;
 	MSG_Init( &omsg, obuf, sizeof( obuf ) );
+
+	// Replay the original playerstate encoding decisions only on the pure re-encode path
+	// (--copy/--verify/--convert). Editing ops re-delta against different bases, so they
+	// must recompute the change-bits from values.
+	g_encReplay = ( skip == NULL );
 
 	int dropFrame = 0;
 

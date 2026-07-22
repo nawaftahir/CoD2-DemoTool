@@ -3223,6 +3223,15 @@ typedef struct
 	int cmdNum;
 	playerState_t ps;
 
+	// Original playerstate delta-encoding decisions, captured at decode time so the
+	// encoder can REPLAY them byte-for-byte instead of recomputing minimal-canonical
+	// change-bits (the server marks angle16 fields changed off full-precision state the
+	// demo doesn't carry). psLc = the original lc byte; psFieldChanged[i] = did the
+	// original write field i as changed (1) or unchanged (0). Valid only when the frame
+	// is re-encoded against its ORIGINAL delta base (the --copy/--verify/--convert path).
+	int psLc;
+	byte psFieldChanged[128];
+
 	int numEntities;
 	int parseEntitiesNum;
 

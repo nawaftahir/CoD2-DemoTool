@@ -168,12 +168,20 @@ void MSG_WriteDeltaField( msg_t *msg, const void *from, const void *to, const ne
 	g_attrCursize = msg->cursize;
 	AttrMark( msg->bit, field->name, field->bits );
 
-	if ( *fromF == *toF )
+	// Replay the original changed-bit when set (g_forceFieldChanged), else recompute.
+	qboolean changed = ( g_forceFieldChanged >= 0 ) ? ( g_forceFieldChanged != 0 )
+	                                                 : ( *fromF != *toF );
+	if ( !changed )
 	{
 		MSG_WriteBit0( msg );      // unchanged
 		return;
 	}
 	MSG_WriteBit1( msg );          // changed
+
+	// g_forceFieldChanged==2 means the original wrote a present-bit=1 with a value whose
+	// transmitted bits are 0 (masked int counter / angle quantized to 0) — recompute keys
+	// off *toF and would drop the present bit, so force it here.
+	const qboolean forcePresent = ( g_forceFieldChanged == 2 );
 
 	switch ( field->bits )
 	{
@@ -224,7 +232,7 @@ void MSG_WriteDeltaField( msg_t *msg, const void *from, const void *to, const ne
 		return;
 	}
 	case -100: // view angle (angle16)
-		if ( *toF )
+		if ( *toF || forcePresent )
 		{
 			MSG_WriteBit1( msg );
 			MSG_WriteAngle16( msg, *(float *)toF );
@@ -235,7 +243,7 @@ void MSG_WriteDeltaField( msg_t *msg, const void *from, const void *to, const ne
 		}
 		return;
 	default: // integer
-		if ( *toF )
+		if ( *toF || forcePresent )
 		{
 			MSG_WriteBit1( msg );
 			MSG_WriteValueNoXor( msg, *toF, field->bits );
@@ -282,13 +290,24 @@ void MSG_WriteDeltaStruct( msg_t *msg, const void *from, const void *to, qboolea
 		return;
 	}
 
+	// Replay the original struct encoding decisions (lc + per-field changed bits) when
+	// available and re-encoding against the original base; else recompute minimal form.
+	const deltaEnc_t *rec = ( g_encReplay && g_encStructEnc && g_encStructEnc->valid ) ? g_encStructEnc : 0;
+
 	int lc = 0;
-	for ( int i = 0; i < numFields; i++ )
+	if ( rec )
 	{
-		int *fromF = ( int * )( (byte *)from + stateFields[ i ].offset );
-		int *toF   = ( int * )( (byte *)to   + stateFields[ i ].offset );
-		if ( *fromF != *toF )
-			lc = i + 1;
+		lc = rec->lc;
+	}
+	else
+	{
+		for ( int i = 0; i < numFields; i++ )
+		{
+			int *fromF = ( int * )( (byte *)from + stateFields[ i ].offset );
+			int *toF   = ( int * )( (byte *)to   + stateFields[ i ].offset );
+			if ( *fromF != *toF )
+				lc = i + 1;
+		}
 	}
 
 	if ( lc )
@@ -299,7 +318,11 @@ void MSG_WriteDeltaStruct( msg_t *msg, const void *from, const void *to, qboolea
 		MSG_WriteBit1( msg );          // has delta
 		MSG_WriteByte( msg, lc );
 		for ( int i = 0; i < lc; i++ )
+		{
+			g_forceFieldChanged = rec ? ( i < 128 ? rec->changed[ i ] : 0 ) : -1;
 			MSG_WriteDeltaField( msg, from, to, &stateFields[ i ] );
+		}
+		g_forceFieldChanged = -1;
 	}
 	else
 	{
@@ -368,13 +391,26 @@ void MSG_WriteDeltaPlayerstate( msg_t *msg, playerState_t *from, playerState_t *
 		Com_Memset( &dummy, 0, sizeof( dummy ) );
 	}
 
+	// Replay the original encoding decisions (lc + per-field changed bits) when we are
+	// re-encoding a snapshot against its original delta base — the only way to reproduce
+	// the server's full-precision change decisions on quantized (angle16) fields byte-1:1.
+	// Otherwise recompute the minimal-canonical form from value comparison.
+	const qboolean replay = ( g_encReplay && g_encSnap && to == &g_encSnap->ps );
+
 	int lc = 0;
-	for ( int i = 0; i < (int)COUNT_OF( playerStateFields ); i++ )
+	if ( replay )
 	{
-		int *fromF = ( int * )( (byte *)from + playerStateFields[ i ].offset );
-		int *toF   = ( int * )( (byte *)to   + playerStateFields[ i ].offset );
-		if ( *fromF != *toF )
-			lc = i + 1;
+		lc = g_encSnap->psLc;
+	}
+	else
+	{
+		for ( int i = 0; i < (int)COUNT_OF( playerStateFields ); i++ )
+		{
+			int *fromF = ( int * )( (byte *)from + playerStateFields[ i ].offset );
+			int *toF   = ( int * )( (byte *)to   + playerStateFields[ i ].offset );
+			if ( *fromF != *toF )
+				lc = i + 1;
+		}
 	}
 
 	MSG_WriteByte( msg, lc );
@@ -388,7 +424,10 @@ void MSG_WriteDeltaPlayerstate( msg_t *msg, playerState_t *from, playerState_t *
 		g_attrCursize = msg->cursize;
 		AttrMark( msg->bit, field->name, field->bits );
 
-		if ( *fromF == *toF )
+		// changed = replay the recorded bit, or recompute from a value compare.
+		qboolean changed = replay ? ( i < 128 && g_encSnap->psFieldChanged[ i ] )
+		                          : ( *fromF != *toF );
+		if ( !changed )
 		{
 			MSG_WriteBit0( msg );      // unchanged
 			continue;
@@ -660,9 +699,11 @@ void SV_EmitPacketEntities( clSnapshot_t *from, clSnapshot_t *to, msg_t *msg )
 		entityState_t *newent = NULL, *oldent = NULL;
 		int newnum = 99999, oldnum = 99999;
 
+		int newSlot = -1;
 		if ( newindex < to_num )
 		{
-			newent = &cl.parseEntities[ ( to->parseEntitiesNum + newindex ) & ( MAX_PARSE_ENTITIES - 1 ) ];
+			newSlot = ( to->parseEntitiesNum + newindex ) & ( MAX_PARSE_ENTITIES - 1 );
+			newent = &cl.parseEntities[ newSlot ];
 			newnum = newent->number;
 		}
 		if ( oldindex < from_num )
@@ -673,19 +714,23 @@ void SV_EmitPacketEntities( clSnapshot_t *from, clSnapshot_t *to, msg_t *msg )
 
 		if ( newnum == oldnum )
 		{
+			g_encStructEnc = &g_entEnc[ newSlot ];
 			MSG_WriteDeltaEntity( msg, oldent, newent, qfalse );  // persisting
 			oldindex++; newindex++;
 		}
 		else if ( newnum < oldnum )
 		{
+			g_encStructEnc = &g_entEnc[ newSlot ];
 			MSG_WriteDeltaEntity( msg, &cl.entityBaselines[ newnum ], newent, qtrue );  // new, from baseline
 			newindex++;
 		}
 		else
 		{
+			g_encStructEnc = 0;                                   // removal: recompute
 			MSG_WriteDeltaEntity( msg, oldent, NULL, qtrue );     // removed
 			oldindex++;
 		}
+		g_encStructEnc = 0;
 	}
 	MSG_WriteBits( msg, MAX_GENTITIES - 1, GENTITYNUM_BITS );      // end-of-list sentinel
 }
@@ -704,9 +749,11 @@ void SV_EmitPacketClients( clSnapshot_t *from, clSnapshot_t *to, msg_t *msg )
 		clientState_t *newcl = NULL, *oldcl = NULL;
 		int newnum = 99999, oldnum = 99999;
 
+		int newSlot = -1;
 		if ( newindex < to_num )
 		{
-			newcl = &cl.parseClients[ ( to->parseClientsNum + newindex ) & ( MAX_PARSE_CLIENTS - 1 ) ];
+			newSlot = ( to->parseClientsNum + newindex ) & ( MAX_PARSE_CLIENTS - 1 );
+			newcl = &cl.parseClients[ newSlot ];
 			newnum = newcl->number;
 		}
 		if ( oldindex < from_num )
@@ -717,19 +764,23 @@ void SV_EmitPacketClients( clSnapshot_t *from, clSnapshot_t *to, msg_t *msg )
 
 		if ( newnum == oldnum )
 		{
+			g_encStructEnc = &g_cliEnc[ newSlot ];
 			MSG_WriteDeltaClient( msg, oldcl, newcl, qfalse );
 			oldindex++; newindex++;
 		}
 		else if ( newnum < oldnum )
 		{
+			g_encStructEnc = &g_cliEnc[ newSlot ];
 			MSG_WriteDeltaClient( msg, NULL, newcl, qtrue );
 			newindex++;
 		}
 		else
 		{
+			g_encStructEnc = 0;
 			MSG_WriteDeltaClient( msg, oldcl, NULL, qtrue );
 			oldindex++;
 		}
+		g_encStructEnc = 0;
 	}
 	MSG_WriteBit0( msg );                                          // no-more-clients
 }
@@ -755,6 +806,7 @@ void SV_WriteSnapshot( clSnapshot_t *snap, msg_t *msg )
 	MSG_WriteByte( msg, snap->snapFlags );
 
 	g_secPlayerstate = msg->cursize;                        // --verify section markers
+	g_encSnap = snap;                                       // source of replay decisions
 	MSG_WriteDeltaPlayerstate( msg, old ? &old->ps : NULL, &snap->ps );
 	g_secEntities = msg->cursize;
 	SV_EmitPacketEntities( old, snap, msg );
@@ -793,6 +845,7 @@ void SV_WriteGameState( msg_t *msg )
 
 	entityState_t nullstate;
 	Com_Memset( &nullstate, 0, sizeof( nullstate ) );
+	g_encStructEnc = 0;   // baselines are always recomputed (no per-entity replay record)
 	for ( int i = 0; i < MAX_GENTITIES; i++ )
 	{
 		entityState_t *base = &cl.entityBaselines[ i ];
