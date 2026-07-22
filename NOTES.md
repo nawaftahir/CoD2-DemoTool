@@ -453,3 +453,24 @@ The record-and-replay pivot lands: `--copy` is now BYTE-IDENTICAL to the input o
 - Gamestate baselines always recompute (no per-entity record); guarded with `g_encStructEnc=0`.
 - NEXT: p119/p120 stat branch under this same model; then the library carve-out can lean on
   `--verify == 0` as its regression gate.
+
+## Track B DONE — full corpus 0-diverged (commit f798e10)
+`--verify` = **0 diverged over 176,549 frames** across 8 demos (p115/117/118 + CoD2x client
++ four long real-server demos with map rotations); `--copy` output is `cmp`-identical to the
+input on all 8. Two final replay classes (both surfaced only by the long server demos):
+1. **Playerstate array masks** (stats/ammo/ammoclip/objectives/hudelems): the server drives
+   these change masks off dirty flags and resends identical values; recompute-from-values
+   dropped the redundant blocks. Now recorded per snapshot and replayed.
+2. **Mid-stream gamestate command order**: connect gamestates are configstrings-then-baselines
+   (matches CoD2rev SV_SendClientGameState), but MAP-CHANGE gamestates arrive
+   **baselines-first and omit some configstrings** — an index scan cannot reproduce that.
+   Now the decoder records the exact command sequence (+ each baseline's delta decisions,
+   same full-precision hazard) and the writer replays it. Synthesized gamestates
+   (--split-match) force the index-scan path via g_encReplay=0.
+- **Protocol P5 resolved from source:** CoD2x = protocol **120** with **wire format identical
+  to 118** (`Refrences/CoD2x/src/shared/shared.h`: "#define PROTOCOL_VERSION 120 // original
+  118"; its patch sources never touch MSG_*/delta code). **119 = the Microsoft Store 1.3
+  re-release** — the STAT_IDENT_CLIENT_HEALTH variant zk_libcod special-cases; parked until a
+  MS-Store demo exists.
+- Corpus grown to 8 demos (corpus/SHA256SUMS); the long server demos are the strongest
+  regression fixtures (mid-stream gamestates + heavy array traffic).
