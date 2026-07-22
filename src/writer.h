@@ -385,6 +385,9 @@ void MSG_WriteDeltaPlayerstate( msg_t *msg, playerState_t *from, playerState_t *
 		int *fromF = ( int * )( (byte *)from + field->offset );
 		int *toF   = ( int * )( (byte *)to   + field->offset );
 
+		g_attrCursize = msg->cursize;
+		AttrMark( msg->bit, field->name, field->bits );
+
 		if ( *fromF == *toF )
 		{
 			MSG_WriteBit0( msg );      // unchanged
