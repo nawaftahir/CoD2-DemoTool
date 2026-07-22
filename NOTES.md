@@ -432,3 +432,24 @@ info → Run anyway"; (5) MS false-positive portal if quarantined. Code signing 
   before touching the codec. (An earlier "non-delta uses previous frame" hypothesis was wrong — it
   over-generalized from the single non-delta outlier; corrected by counting deltaNum of every diverged
   frame.)
+
+## P4 COMPLETE — byte-1:1 achieved (commit 4dcae9e)
+The record-and-replay pivot lands: `--copy` is now BYTE-IDENTICAL to the input on disk and
+`--verify` reports 0 diverged across the whole corpus (p115/117/118/cod2x, ~13,500 frames).
+- **The decoder records each field's original encoding decision** and the encoder replays it
+  verbatim, instead of recomputing a minimal-canonical form from a value compare. Two decision
+  classes had to be recorded (both stem from the demo not carrying the server's internal
+  full-precision state):
+  1. **top-level changed-bit** — the server marks a field changed off full-precision (angle16
+     view angles move sub-quantum; the transmitted short is identical to the base's).
+  2. **present sub-bit forced on a zero-looking value** — a field whose transmitted bits are 0
+     but whose real value is nonzero (mod-256 event counters: value 256/512/… → present-bit=1,
+     low 8 bits 0). Recompute keys off the decoded (masked) value and would drop the present bit.
+- Model: `deltaEnc_t{lc, changed[128], valid}` rings parallel to parseEntities/parseClients, plus
+  `psLc`/`psFieldChanged[]` on clSnapshot_t for playerstate. `changed[i]` is 0 (unchanged) / 1
+  (changed, recompute the value form) / 2 (changed, force present). Encoder consults them only when
+  `g_encReplay` is set (the pure re-encode path); editing ops (skip-dead/cut/merge) re-delta against
+  different bases so they must recompute — `g_encReplay=0` there, unchanged behavior.
+- Gamestate baselines always recompute (no per-entity record); guarded with `g_encStructEnc=0`.
+- NEXT: p119/p120 stat branch under this same model; then the library carve-out can lean on
+  `--verify == 0` as its regression gate.
