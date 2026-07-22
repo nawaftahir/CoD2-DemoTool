@@ -416,14 +416,19 @@ info → Run anyway"; (5) MS false-positive portal if quarantined. Code signing 
   trailing byte). Byte markers are reliable; use them to map the first divergent byte to entity+field.
 - **Remaining divergences are a real non-canonical-encoding class, and the tool is semantically 1:1**
   on them (verified: --copy then --dump both -> every decoded field value identical; only the readcount
-  prefixes shift by the few bits the re-encode differs). The pattern: in a snapshot whose header is
-  non-delta (deltaNumByte=0, old=NULL), an entity float that goes nonzero->0 across frames is emitted by
-  the recording engine as "changed then zero-bit" (2 bits), which is only possible if its delta `from`
-  was the *previous frame's* value, not the static gamestate baseline (0). Proof: p115 frame2 entity4
-  `pos.trDelta[2]` was SMALLINT -1 in frame1 and encodes as changed->zero in frame2 — impossible from a
-  baseline of 0 (that would be an "unchanged" 1-bit). CoD2rev's stock server (SV_WriteSnapshotToClient
-  passes oldframe=NULL when non-delta; SV_CreateBaseline only baselines linked map ents, never players)
-  would emit the 1-bit form, so these client demos were produced against a `from` = previous frame for
-  entities even on non-delta headers. NEXT: reproduce by having the encoder (and, losslessly, the
-  decoder) use the previous decoded frame's parseEntities as the entity `from` on non-delta snapshots,
-  then re-verify. Open design question to confirm with a wider corpus before committing that change.
+  prefixes shift by the few bits the re-encode differs). **Classification: of 760 diverged frames on p115,
+  759 are DELTA frames diverging in PLAYERSTATE, 1 is non-delta diverging in entities.** Root cause: our
+  encoder recomputes minimal-canonical change-bits by comparing from/to VALUES, but the SERVER marked
+  fields changed off FULL-PRECISION state the demo doesn't carry. Proof: the first delta divergence
+  (frame12) is at playerstate `viewangles[0]` (bits=-100 = **angle16, quantized**). angle16 round-trips
+  perfectly (all 65536 shorts, 0 failures), so it is NOT a value bug — the original marked viewangles[0]
+  CHANGED (wrote a short) while we wrote "unchanged" because our from==to (both quantized-equal). The
+  server compares real-float viewangles and emits "changed" for sub-quantum moves even when the
+  transmitted angle16 short equals the base's; we only have the quantized short, so change decisions can't
+  be re-derived from values. The 1 non-delta entity case (trDelta[2] changed->zero) is the same class.
+  **FIX = the P4 architectural pivot: the DECODER records the original per-field changed/lc decisions into
+  the model and the ENCODER replays them verbatim, instead of recomputing minimal forms from value
+  compares.** Substantial (thread "original encoding decisions" through decode->model->encode); design it
+  before touching the codec. (An earlier "non-delta uses previous frame" hypothesis was wrong — it
+  over-generalized from the single non-delta outlier; corrected by counting deltaNum of every diverged
+  frame.)
