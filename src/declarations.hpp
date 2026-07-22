@@ -3231,6 +3231,13 @@ typedef struct
 	// is re-encoded against its ORIGINAL delta base (the --copy/--verify/--convert path).
 	int psLc;
 	byte psFieldChanged[128];
+	// Array-section masks the original wire carried. The server sets these from dirty
+	// flags, not value compares, so it resends identical values — a recompute drops
+	// those blocks and diverges.
+	byte psStatsPresent; byte psStatsBits;
+	byte psAmmoPresent;  byte psAmmoBank[4]; unsigned short psAmmoMask[4];
+	byte psClipBank[4];  unsigned short psClipMask[4];
+	byte psObjPresent;   byte psHudPresent;
 
 	int numEntities;
 	int parseEntitiesNum;

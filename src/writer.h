@@ -470,16 +470,24 @@ void MSG_WriteDeltaPlayerstate( msg_t *msg, playerState_t *from, playerState_t *
 		}
 	}
 
-	// stats (6-bit change mask)
+	// stats (6-bit change mask). Replay: the server drives these masks off dirty flags,
+	// not value compares, and resends identical values — recompute drops those blocks.
 	int statsbits = 0;
-	if ( to->stats[ STAT_HEALTH ]            != from->stats[ STAT_HEALTH ] )            statsbits |= 1;
-	if ( to->stats[ STAT_DEAD_YAW ]          != from->stats[ STAT_DEAD_YAW ] )          statsbits |= 2;
-	if ( to->stats[ STAT_MAX_HEALTH ]        != from->stats[ STAT_MAX_HEALTH ] )        statsbits |= 4;
-	if ( to->stats[ STAT_IDENT_CLIENT_NUM ]  != from->stats[ STAT_IDENT_CLIENT_NUM ] )  statsbits |= 8;
-	if ( to->stats[ STAT_IDENT_CLIENT_HEALTH]!= from->stats[ STAT_IDENT_CLIENT_HEALTH]) statsbits |= 0x10;
-	if ( to->stats[ STAT_SPAWN_COUNT ]       != from->stats[ STAT_SPAWN_COUNT ] )       statsbits |= 0x20;
+	if ( replay )
+	{
+		statsbits = g_encSnap->psStatsPresent ? g_encSnap->psStatsBits : 0;
+	}
+	else
+	{
+		if ( to->stats[ STAT_HEALTH ]            != from->stats[ STAT_HEALTH ] )            statsbits |= 1;
+		if ( to->stats[ STAT_DEAD_YAW ]          != from->stats[ STAT_DEAD_YAW ] )          statsbits |= 2;
+		if ( to->stats[ STAT_MAX_HEALTH ]        != from->stats[ STAT_MAX_HEALTH ] )        statsbits |= 4;
+		if ( to->stats[ STAT_IDENT_CLIENT_NUM ]  != from->stats[ STAT_IDENT_CLIENT_NUM ] )  statsbits |= 8;
+		if ( to->stats[ STAT_IDENT_CLIENT_HEALTH]!= from->stats[ STAT_IDENT_CLIENT_HEALTH]) statsbits |= 0x10;
+		if ( to->stats[ STAT_SPAWN_COUNT ]       != from->stats[ STAT_SPAWN_COUNT ] )       statsbits |= 0x20;
+	}
 
-	if ( statsbits )
+	if ( statsbits || ( replay && g_encSnap->psStatsPresent ) )
 	{
 		MSG_WriteBit1( msg );
 		MSG_WriteBits( msg, statsbits, STATSBITS_COUNT );
@@ -497,19 +505,31 @@ void MSG_WriteDeltaPlayerstate( msg_t *msg, playerState_t *from, playerState_t *
 
 	// ammo stored (outer present bit, then 4 groups of 16)
 	int ammobits[ 4 ];
-	for ( int j = 0; j < 4; j++ )
+	int ammoOuter;
+	if ( replay )
 	{
-		ammobits[ j ] = 0;
-		for ( int i = 0; i < 16; i++ )
-			if ( to->ammo[ i + j * 16 ] != from->ammo[ i + j * 16 ] )
-				ammobits[ j ] |= 1 << i;
+		for ( int j = 0; j < 4; j++ )
+			ammobits[ j ] = g_encSnap->psAmmoBank[ j ] ? g_encSnap->psAmmoMask[ j ] : 0;
+		ammoOuter = g_encSnap->psAmmoPresent;
 	}
-	if ( ammobits[ 0 ] || ammobits[ 1 ] || ammobits[ 2 ] || ammobits[ 3 ] )
+	else
+	{
+		for ( int j = 0; j < 4; j++ )
+		{
+			ammobits[ j ] = 0;
+			for ( int i = 0; i < 16; i++ )
+				if ( to->ammo[ i + j * 16 ] != from->ammo[ i + j * 16 ] )
+					ammobits[ j ] |= 1 << i;
+		}
+		ammoOuter = ( ammobits[ 0 ] || ammobits[ 1 ] || ammobits[ 2 ] || ammobits[ 3 ] );
+	}
+	if ( ammoOuter )
 	{
 		MSG_WriteBit1( msg );
 		for ( int j = 0; j < 4; j++ )
 		{
-			if ( ammobits[ j ] )
+			int bankPresent = replay ? g_encSnap->psAmmoBank[ j ] : ( ammobits[ j ] != 0 );
+			if ( bankPresent )
 			{
 				MSG_WriteBit1( msg );
 				MSG_WriteShort( msg, ammobits[ j ] );
@@ -532,10 +552,20 @@ void MSG_WriteDeltaPlayerstate( msg_t *msg, playerState_t *from, playerState_t *
 	for ( int j = 0; j < 4; j++ )
 	{
 		int clipbits = 0;
-		for ( int i = 0; i < 16; i++ )
-			if ( to->ammoclip[ i + j * 16 ] != from->ammoclip[ i + j * 16 ] )
-				clipbits |= 1 << i;
-		if ( clipbits )
+		int bankPresent;
+		if ( replay )
+		{
+			clipbits = g_encSnap->psClipBank[ j ] ? g_encSnap->psClipMask[ j ] : 0;
+			bankPresent = g_encSnap->psClipBank[ j ];
+		}
+		else
+		{
+			for ( int i = 0; i < 16; i++ )
+				if ( to->ammoclip[ i + j * 16 ] != from->ammoclip[ i + j * 16 ] )
+					clipbits |= 1 << i;
+			bankPresent = ( clipbits != 0 );
+		}
+		if ( bankPresent )
 		{
 			MSG_WriteBit1( msg );
 			MSG_WriteShort( msg, clipbits );
@@ -550,7 +580,9 @@ void MSG_WriteDeltaPlayerstate( msg_t *msg, playerState_t *from, playerState_t *
 	}
 
 	// objectives
-	if ( memcmp( from->objective, to->objective, sizeof( from->objective ) ) )
+	qboolean objPresent = replay ? ( g_encSnap->psObjPresent != 0 )
+	                             : ( memcmp( from->objective, to->objective, sizeof( from->objective ) ) != 0 );
+	if ( objPresent )
 	{
 		MSG_WriteBit1( msg );
 		for ( int i = 0; i < MAX_OBJECTIVES; i++ )
@@ -566,7 +598,9 @@ void MSG_WriteDeltaPlayerstate( msg_t *msg, playerState_t *from, playerState_t *
 	}
 
 	// hud elements
-	if ( memcmp( &from->hud, &to->hud, sizeof( from->hud ) ) )
+	qboolean hudPresent = replay ? ( g_encSnap->psHudPresent != 0 )
+	                             : ( memcmp( &from->hud, &to->hud, sizeof( from->hud ) ) != 0 );
+	if ( hudPresent )
 	{
 		MSG_WriteBit1( msg );
 		MSG_WriteDeltaHudElems( msg, from->hud.archival, to->hud.archival, MAX_HUDELEMS_ARCHIVAL );
@@ -814,45 +848,74 @@ void SV_WriteSnapshot( clSnapshot_t *snap, msg_t *msg )
 	SV_EmitPacketClients( old, snap, msg );
 }
 
+// Emit one configstring command ([svc_configstring][index][string]), applying the
+// --convert serverinfo rewrite on configstring 0.
+static void SV_WriteConfigstringCmd( msg_t *msg, int i )
+{
+	const char *cs = cl.gameState.stringData + cl.gameState.stringOffsets[ i ];
+	MSG_WriteByte( msg, svc_configstring );
+	MSG_WriteShort( msg, i );
+	if ( i == 0 && g_convertProtocol )
+	{
+		char patched[ MAX_STRING_CHARS * 2 ];
+		Q_strncpyz( patched, cs, sizeof( patched ) );
+		char protoStr[ 16 ]; snprintf( protoStr, sizeof( protoStr ), "%d", g_convertProtocol );
+		Info_SetValueForKey( patched, sizeof( patched ), "protocol", protoStr );
+		Info_SetValueForKey( patched, sizeof( patched ), "shortversion", ProtocolShortVersion( g_convertProtocol ) );
+		MSG_WriteBigStringRaw( msg, patched );
+	}
+	else
+		MSG_WriteBigStringRaw( msg, cs );
+}
+
 // Full svc_gamestate from the decoded configstrings + baselines.
 void SV_WriteGameState( msg_t *msg )
 {
-	MSG_WriteByte( msg, svc_gamestate );
-	MSG_WriteLong( msg, clc.serverCommandSequence );
-
-	for ( int i = 0; i < MAX_CONFIGSTRINGS; i++ )
-	{
-		if ( cl.gameState.stringOffsets[ i ] == 0 )
-			continue;
-		const char *cs = cl.gameState.stringData + cl.gameState.stringOffsets[ i ];
-		if ( !cs[ 0 ] )
-			continue;
-		MSG_WriteByte( msg, svc_configstring );
-		MSG_WriteShort( msg, i );
-		// --convert: rewrite protocol / shortversion in the serverinfo (configstring 0)
-		if ( i == 0 && g_convertProtocol )
-		{
-			char patched[ MAX_STRING_CHARS * 2 ];
-			Q_strncpyz( patched, cs, sizeof( patched ) );
-			char protoStr[ 16 ]; snprintf( protoStr, sizeof( protoStr ), "%d", g_convertProtocol );
-			Info_SetValueForKey( patched, sizeof( patched ), "protocol", protoStr );
-			Info_SetValueForKey( patched, sizeof( patched ), "shortversion", ProtocolShortVersion( g_convertProtocol ) );
-			MSG_WriteBigStringRaw( msg, patched );
-		}
-		else
-			MSG_WriteBigStringRaw( msg, cs );
-	}
-
 	entityState_t nullstate;
 	Com_Memset( &nullstate, 0, sizeof( nullstate ) );
 	g_encStructEnc = 0;   // baselines are always recomputed (no per-entity replay record)
-	for ( int i = 0; i < MAX_GENTITIES; i++ )
+
+	MSG_WriteByte( msg, svc_gamestate );
+	MSG_WriteLong( msg, clc.serverCommandSequence );
+
+	if ( g_encReplay && g_gsCmdN > 0 )
 	{
-		entityState_t *base = &cl.entityBaselines[ i ];
-		if ( !base->number )
-			continue;
-		MSG_WriteByte( msg, svc_baseline );
-		MSG_WriteDeltaEntity( msg, &nullstate, base, qtrue );
+		// Replay the original gamestate's exact command order. Connect gamestates are
+		// configstrings-then-baselines, but mid-stream (map change) gamestates are
+		// baselines-first and omit some configstrings — an index scan can't reproduce that.
+		for ( int k = 0; k < g_gsCmdN; k++ )
+		{
+			if ( g_gsCmds[ k ].kind == 0 )
+				SV_WriteConfigstringCmd( msg, g_gsCmds[ k ].index );
+			else
+			{
+				MSG_WriteByte( msg, svc_baseline );
+				g_encStructEnc = &g_gsCmds[ k ].enc;   // replay the baseline's original delta decisions
+				MSG_WriteDeltaEntity( msg, &nullstate, &cl.entityBaselines[ g_gsCmds[ k ].index ], qtrue );
+				g_encStructEnc = 0;
+			}
+		}
+	}
+	else
+	{
+		for ( int i = 0; i < MAX_CONFIGSTRINGS; i++ )
+		{
+			if ( cl.gameState.stringOffsets[ i ] == 0 )
+				continue;
+			const char *cs = cl.gameState.stringData + cl.gameState.stringOffsets[ i ];
+			if ( !cs[ 0 ] )
+				continue;
+			SV_WriteConfigstringCmd( msg, i );
+		}
+
+		for ( int i = 0; i < MAX_GENTITIES; i++ )
+		{
+			entityState_t *base = &cl.entityBaselines[ i ];
+			if ( !base->number )
+				continue;
+			MSG_WriteByte( msg, svc_baseline );
+			MSG_WriteDeltaEntity( msg, &nullstate, base, qtrue );
+		}
 	}
 
 	MSG_WriteByte( msg, svc_EOF );

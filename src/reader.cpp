@@ -45,6 +45,14 @@ int g_quietLog = 0;   // when set, Com_Printf is a no-op (--copy avoids per-call
 // it is re-encoding against the original delta base (copy/verify/convert), else recomputes.
 int g_recPsLc = 0;
 byte g_recPsChanged[128];
+// Array-section masks (stats/ammo/ammoclip/objectives/hudelems) from the last decoded
+// playerstate — the server drives these off dirty flags, resending identical values.
+byte g_recPsStatsPresent, g_recPsStatsBits;
+byte g_recPsAmmoPresent, g_recPsAmmoBank[4];
+unsigned short g_recPsAmmoMask[4];
+byte g_recPsClipBank[4];
+unsigned short g_recPsClipMask[4];
+byte g_recPsObjPresent, g_recPsHudPresent;
 int g_encReplay = 0;                 // 1 = replay original encoding decisions verbatim
 const clSnapshot_t *g_encSnap = 0;   // the snapshot being encoded (source of replay decisions)
 
@@ -60,6 +68,16 @@ static deltaEnc_t g_entEnc[MAX_PARSE_ENTITIES];
 static deltaEnc_t g_cliEnc[MAX_PARSE_CLIENTS];
 const deltaEnc_t *g_encStructEnc = 0;   // record for the entity/client currently being encoded
 int g_forceFieldChanged = -1;           // -1 = recompute changed-bit; 0/1 = replay this bit
+
+// Gamestate command-order record. Connect gamestates are configstrings-then-baselines,
+// but mid-stream (map change) gamestates are baselines-first with configstring gaps —
+// the writer must replay the original command sequence, not re-derive it by index scan.
+// Baseline commands also carry the original entity-delta decisions (same full-precision
+// change-detection hazard as snapshot entities).
+typedef struct { unsigned short kind; unsigned short index; deltaEnc_t enc; } gsCmd_t;   // kind: 0=configstring, 1=baseline
+#define GS_CMDS_MAX 4096
+gsCmd_t g_gsCmds[GS_CMDS_MAX];
+int g_gsCmdN = 0;
 int g_dumpCommands = 0;   // when set, CL_ParseCommandString prints each server command (for --commands)
 
 // Server-command filters (Caball-style). Applied during transcode: a dropped
@@ -1677,12 +1695,20 @@ void MSG_ReadDeltaPlayerstate(msg_t *msg, playerState_t *from, playerState_t *to
 	// stats
 	int statsbits = 0;
 
-
+	// reset the array-mask record for this playerstate
+	g_recPsStatsPresent = 0; g_recPsStatsBits = 0;
+	g_recPsAmmoPresent = 0;
+	Com_Memset( g_recPsAmmoBank, 0, sizeof( g_recPsAmmoBank ) );
+	Com_Memset( g_recPsAmmoMask, 0, sizeof( g_recPsAmmoMask ) );
+	Com_Memset( g_recPsClipBank, 0, sizeof( g_recPsClipBank ) );
+	Com_Memset( g_recPsClipMask, 0, sizeof( g_recPsClipMask ) );
+	g_recPsObjPresent = 0; g_recPsHudPresent = 0;
 
 	if ( MSG_ReadBits( msg, 1 ) ) {  // one general bit tells if any of this infrequently changing stuff has changed
 		statsbits = MSG_ReadBits(msg, 6);
+		g_recPsStatsPresent = 1; g_recPsStatsBits = (byte)statsbits;
 
-		
+
 		Com_Printf( "%s ", "PS_STATS" );
 
 		if ( (statsbits & 1) != 0 )
@@ -1710,12 +1736,15 @@ void MSG_ReadDeltaPlayerstate(msg_t *msg, playerState_t *from, playerState_t *to
 	int ammobits = 0;
 	if ( MSG_ReadBit(msg) )
 	{
+		g_recPsAmmoPresent = 1;
 		for ( i = 0; i < 4; ++i )
 		{
 			if ( MSG_ReadBit(msg) )
 			{
 				Com_Printf( "%s ", "PS_AMMO" );
 				ammobits = MSG_ReadShort(msg);
+				g_recPsAmmoBank[i] = 1;
+				g_recPsAmmoMask[i] = (unsigned short)ammobits;
 
 				for ( j = 0; j < 16; ++j )
 				{
@@ -1754,6 +1783,8 @@ void MSG_ReadDeltaPlayerstate(msg_t *msg, playerState_t *from, playerState_t *to
 		{
 			Com_Printf( "%s ", "PS_AMMOCLIP" );
 			clipbits = MSG_ReadShort(msg);
+			g_recPsClipBank[i] = 1;
+			g_recPsClipMask[i] = (unsigned short)clipbits;
 
 			for ( j = 0; j < 16; ++j )
 			{
@@ -1782,6 +1813,7 @@ void MSG_ReadDeltaPlayerstate(msg_t *msg, playerState_t *from, playerState_t *to
 	// Objectives
 	if ( MSG_ReadBit(msg) )
 	{
+		g_recPsObjPresent = 1;
 		for ( i = 0; i < MAX_OBJECTIVES; ++i )
 		{
 			to->objective[i].state = MSG_ReadBits(msg, 3);
@@ -1792,6 +1824,7 @@ void MSG_ReadDeltaPlayerstate(msg_t *msg, playerState_t *from, playerState_t *to
 	// Hud-elements
 	if ( MSG_ReadBit(msg) )
 	{
+		g_recPsHudPresent = 1;
 		MSG_ReadDeltaHudElems(msg, from->hud.archival, to->hud.archival, MAX_HUDELEMS_ARCHIVAL);
 		MSG_ReadDeltaHudElems(msg, from->hud.current, to->hud.current, MAX_HUDELEMS_CURRENT);
 	}
@@ -2210,6 +2243,13 @@ void CL_ParseSnapshot( msg_t *msg ) {
 	// Capture the original playerstate encoding decisions for byte-1:1 replay.
 	newSnap.psLc = g_recPsLc;
 	Com_Memcpy( newSnap.psFieldChanged, g_recPsChanged, sizeof( newSnap.psFieldChanged ) );
+	newSnap.psStatsPresent = g_recPsStatsPresent;  newSnap.psStatsBits = g_recPsStatsBits;
+	newSnap.psAmmoPresent  = g_recPsAmmoPresent;
+	Com_Memcpy( newSnap.psAmmoBank, g_recPsAmmoBank, sizeof( newSnap.psAmmoBank ) );
+	Com_Memcpy( newSnap.psAmmoMask, g_recPsAmmoMask, sizeof( newSnap.psAmmoMask ) );
+	Com_Memcpy( newSnap.psClipBank, g_recPsClipBank, sizeof( newSnap.psClipBank ) );
+	Com_Memcpy( newSnap.psClipMask, g_recPsClipMask, sizeof( newSnap.psClipMask ) );
+	newSnap.psObjPresent = g_recPsObjPresent;  newSnap.psHudPresent = g_recPsHudPresent;
 
 	// read packet entities
 	SHOWNET( msg, "packet entities" );
@@ -2298,6 +2338,8 @@ void CL_ParseGamestate( msg_t *msg )
 	// a gamestate always marks a server command sequence
 	clc.serverCommandSequence = MSG_ReadLong( msg );
 
+	g_gsCmdN = 0;   // record this gamestate's command order for byte-1:1 replay
+
 	// parse all the configstrings and baselines
 	cl.gameState.dataCount = 1; // leave a 0 at the beginning for uninitialized configstrings
 	while ( 1 )
@@ -2318,6 +2360,7 @@ void CL_ParseGamestate( msg_t *msg )
 			{
 				Com_Error( ERR_DROP, "configstring > MAX_CONFIGSTRINGS" );
 			}
+			if ( g_gsCmdN < GS_CMDS_MAX ) { g_gsCmds[ g_gsCmdN ].kind = 0; g_gsCmds[ g_gsCmdN ].index = (unsigned short)i; g_gsCmdN++; }
 			s = MSG_ReadBigString( msg );
 
 			len = strlen( s );
@@ -2346,6 +2389,19 @@ void CL_ParseGamestate( msg_t *msg )
 			memset( &nullstate, 0, sizeof( nullstate ) );
 			es = &cl.entityBaselines[ newnum ];
 			MSG_ReadDeltaEntity( msg, &nullstate, es, newnum );
+			if ( g_gsCmdN < GS_CMDS_MAX )
+			{
+				gsCmd_t *gc = &g_gsCmds[ g_gsCmdN ];
+				gc->kind = 1; gc->index = (unsigned short)newnum;
+				// capture the baseline's original delta decisions for byte-1:1 replay
+				gc->enc.valid = ( g_recStructLc >= 0 );
+				if ( gc->enc.valid )
+				{
+					gc->enc.lc = g_recStructLc;
+					Com_Memcpy( gc->enc.changed, g_recStructChanged, sizeof( gc->enc.changed ) );
+				}
+				g_gsCmdN++;
+			}
 		}
 		else
 		{
@@ -3531,7 +3587,11 @@ static int Cmd_Split( const char *inPath, int byMatch )
 			{
 				static byte gbuf[ MAX_MSGLEN ];
 				msg_t gmsg; MSG_Init( &gmsg, gbuf, sizeof( gbuf ) );
+				// synthesized gamestate: force the index-scan path (a stale replay record
+				// from the last decoded gamestate would emit the wrong command order)
+				int savedReplay = g_encReplay; g_encReplay = 0;
 				SV_WriteGameState( &gmsg );                 // full gamestate from the live cl.gameState
+				g_encReplay = savedReplay;
 				Demo_WriteFrame( out, outSeq++, 0, gmsg.data, gmsg.cursize );
 				segFrames++;
 			}
